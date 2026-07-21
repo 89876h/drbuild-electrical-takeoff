@@ -45,7 +45,6 @@ def load_image_safely(uploaded_file):
     """Safely opens an uploaded image file, downscaling if dimensions exceed safe limits."""
     try:
         img = Image.open(uploaded_file).convert("RGB")
-        # Increase limit for high-res construction drawings
         if max(img.size) > 5000:
             img.thumbnail((5000, 5000), Image.Resampling.LANCZOS)
         return img
@@ -55,33 +54,23 @@ def load_image_safely(uploaded_file):
 
 
 def extract_symbols_from_legend(legend_img, category_filter):
-    """
-    Adaptive symbol extraction using connected components.
-    Detects dark blobs within specific vertical sections of the legend.
-    """
+    """Adaptive symbol extraction using connected components."""
     legend_cv = np.array(legend_img)
     gray = cv2.cvtColor(legend_cv, cv2.COLOR_RGB2GRAY)
     h_leg, w_leg = gray.shape[:2]
 
     # Define section boundaries based on typical electrical legend layouts
-    # Adjust these ratios if your legend has different spacing
     if category_filter == "Power / Devices":
-        # Receptacles, Outlets, Electrical Equipment
         y_start = int(h_leg * 0.42)
         y_end = int(h_leg * 0.62)
     elif category_filter == "Lighting":
-        # Lighting fixtures section
         y_start = int(h_leg * 0.62)
         y_end = int(h_leg * 0.78)
     else:
         y_start, y_end = 0, h_leg
 
     section = gray[y_start:y_end, :]
-
-    # Invert threshold: symbols are dark on white background
     _, binary = cv2.threshold(section, 180, 255, cv2.THRESH_BINARY_INV)
-
-    # Find connected components (each symbol blob)
     num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
         binary, connectivity=8
     )
@@ -90,10 +79,8 @@ def extract_symbols_from_legend(legend_img, category_filter):
     item_counter = 1
     prefix = "Device" if category_filter == "Power / Devices" else "Fixture"
 
-    for i in range(1, num_labels):  # Skip background label 0
+    for i in range(1, num_labels):
         x, y, w, h, area = stats[i]
-
-        # Filter out text lines, noise, and overly large elements
         aspect_ratio = w / max(1, h)
         if area < 30 or area > 5000:
             continue
@@ -102,7 +89,6 @@ def extract_symbols_from_legend(legend_img, category_filter):
         if w < 8 or h < 8:
             continue
 
-        # Extract tight crop around symbol with small padding
         pad = 3
         sy1 = max(0, y - pad)
         sy2 = min(section.shape[0], y + h + pad)
@@ -110,8 +96,6 @@ def extract_symbols_from_legend(legend_img, category_filter):
         sx2 = min(section.shape[1], x + w + pad)
 
         symbol_crop = section[sy1:sy2, sx1:sx2]
-
-        # Normalize all templates to a standard height for consistent matching
         target_h = 40
         scale = target_h / max(1, symbol_crop.shape[0])
         new_w = max(10, int(symbol_crop.shape[1] * scale))
@@ -138,10 +122,7 @@ def extract_symbols_from_legend(legend_img, category_filter):
 
 
 def multi_scale_match(drawing_gray, template, scales=(0.5, 0.7, 0.85, 1.0, 1.2, 1.5, 2.0), threshold=0.65):
-    """
-    Multi-scale template matching with correct deduplication.
-    Tests multiple scale factors since cv2.matchTemplate is NOT scale-invariant.
-    """
+    """Multi-scale template matching with correct deduplication."""
     all_matches = []
 
     for scale in scales:
@@ -149,7 +130,6 @@ def multi_scale_match(drawing_gray, template, scales=(0.5, 0.7, 0.85, 1.0, 1.2, 
             template, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA
         )
 
-        # Skip if scaled template exceeds drawing dimensions
         if (
             scaled_template.shape[0] > drawing_gray.shape[0]
             or scaled_template.shape[1] > drawing_gray.shape[1]
@@ -163,33 +143,31 @@ def multi_scale_match(drawing_gray, template, scales=(0.5, 0.7, 0.85, 1.0, 1.2, 
         points = list(zip(*loc[::-1]))
 
         for pt in points:
-            # Store as FLAT tuple: (point_tuple, scale, score)
             all_matches.append((pt, scale, float(res[pt[1], pt[0]])))
 
-    # Sort by score descending so best matches are prioritized during deduplication
     all_matches.sort(key=lambda x: -x[2])
 
     filtered = []
     for pt, sc, score in all_matches:
         too_close = False
         for fm_pt, fm_sc, fm_score in filtered:
-            # Correct indexing: fm_pt is already the (x,y) tuple
             if abs(pt[0] - fm_pt[0]) < 20 and abs(pt[1] - fm_pt[1]) < 20:
                 too_close = True
                 break
-
         if not too_close:
             filtered.append((pt, sc, score))
 
     return filtered
 
 
-def run_strict_takeoff_module(legend_img, drawing_imgs, package_name, category_filter):
-    """Performs strict computer vision extraction with multi-scale matching."""
+def run_strict_takeoff_module_live(legend_img, drawing_imgs, package_name, category_filter, status_placeholder, table_placeholder, existing_rows):
+    """
+    Performs strict computer vision extraction with LIVE UI updates.
+    Updates the status block and table after every single drawing is processed.
+    """
     if not drawing_imgs or not legend_img:
         return pd.DataFrame()
 
-    # Validate drawings before processing
     valid_drawings = []
     for d_img in drawing_imgs:
         if d_img is None:
@@ -200,39 +178,62 @@ def run_strict_takeoff_module(legend_img, drawing_imgs, package_name, category_f
         valid_drawings.append(d_arr)
 
     if not valid_drawings:
-        st.warning(f"No valid drawings found for {package_name}")
+        status_placeholder.warning(f"No valid drawings found for {package_name}")
         return pd.DataFrame()
 
-    # Extract symbols adaptively from legend
     extracted_items = extract_symbols_from_legend(legend_img, category_filter)
-
     if not extracted_items:
-        st.warning(
-            f"No symbols detected in legend for '{category_filter}'. "
-            f"Check section boundaries in extract_symbols_from_legend()."
-        )
+        status_placeholder.warning(f"No symbols detected for '{category_filter}'.")
         return pd.DataFrame()
 
-    table_rows = []
-    for item in extracted_items:
-        template = item["template"]
-        total_count = 0
+    total_drawings = len(valid_drawings)
+    
+    # Process each drawing and update UI immediately
+    for idx, d_arr in enumerate(valid_drawings, 1):
+        # Update Status Block (Max 4 lines)
+        status_text = (
+            f"**Scanning:** {package_name}\n"
+            f"**Progress:** Drawing {idx}/{total_drawings}\n"
+            f"**Symbols Found:** {len(extracted_items)} templates active\n"
+            f"**Status:** Matching scale variants..."
+        )
+        status_placeholder.info(status_text)
 
-        for d_arr in valid_drawings:
-            matches = multi_scale_match(d_arr, template, threshold=0.65)
-            total_count += len(matches)
+        # Accumulate counts for each symbol
+        for item in extracted_items:
+            matches = multi_scale_match(d_arr, item["template"], threshold=0.65)
+            
+            # Find or create row for this symbol
+            symbol_key = item["name"]
+            found = False
+            for row in existing_rows:
+                if row["Model / Description"] == symbol_key:
+                    row["Count"] += len(matches)
+                    found = True
+                    break
+            
+            if not found:
+                existing_rows.append({
+                    "System Category": item["category"],
+                    "Legend Icon": item["icon_bytes"],
+                    "Model / Description": symbol_key,
+                    "Scan Package": package_name,
+                    "Count": len(matches),
+                })
 
-        table_rows.append(
-            {
-                "System Category": item["category"],
-                "Legend Icon": item["icon_bytes"],
-                "Model / Description": item["name"],
-                "Scan Package": package_name,
-                "Count": total_count,
-            }
+        # Dynamically update the table placeholder
+        live_df = pd.DataFrame(existing_rows)
+        table_placeholder.dataframe(
+            live_df,
+            column_config={
+                "Legend Icon": st.column_config.ImageColumn("Legend Symbol", width="small"),
+                "Count": st.column_config.NumberColumn("Verified Count", format="%d ⚡"),
+            },
+            use_container_width=True,
+            hide_index=True,
         )
 
-    return pd.DataFrame(table_rows)
+    return pd.DataFrame(existing_rows)
 
 
 if process_btn:
@@ -241,41 +242,41 @@ if process_btn:
     elif not power_files and not lighting_files:
         st.warning("Please upload at least one Power or Lighting drawing file.")
     else:
-        with st.spinner("Executing strict computer vision scan across drawings..."):
-            legend_image = load_image_safely(legend_file)
+        # Create persistent placeholders for live updates
+        status_box = st.empty()
+        table_box = st.empty()
+        
+        legend_image = load_image_safely(legend_file)
+        power_images = [load_image_safely(f) for f in (power_files or []) if load_image_safely(f)]
+        lighting_images = [load_image_safely(f) for f in (lighting_files or []) if load_image_safely(f)]
 
-            power_images = [
-                load_image_safely(f) for f in (power_files or []) if load_image_safely(f)
-            ]
-            lighting_images = [
-                load_image_safely(f)
-                for f in (lighting_files or [])
-                if load_image_safely(f)
-            ]
+        # Shared list to accumulate results across packages
+        accumulated_rows = []
 
-            df_power = run_strict_takeoff_module(
-                legend_image, power_images, "Power Package", "Power / Devices"
-            )
-            df_lighting = run_strict_takeoff_module(
-                legend_image, lighting_images, "Lighting Package", "Lighting"
-            )
+        # Run Power Scan with Live Updates
+        df_power = run_strict_takeoff_module_live(
+            legend_image, power_images, "Power Package", "Power / Devices", 
+            status_box, table_box, accumulated_rows
+        )
+        
+        # Run Lighting Scan with Live Updates (continues accumulating)
+        df_lighting = run_strict_takeoff_module_live(
+            legend_image, lighting_images, "Lighting Package", "Lighting", 
+            status_box, table_box, accumulated_rows
+        )
 
-            frames = [f for f in [df_power, df_lighting] if not f.empty]
-            df_summary = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-
+        # Finalize
+        df_summary = pd.DataFrame(accumulated_rows) if accumulated_rows else pd.DataFrame()
+        
         if not df_summary.empty:
-            st.success("Strict takeoff scan complete!")
-
-            st.subheader(" Itemized Takeoff Schedule")
+            status_box.success("✅ Strict takeoff scan complete! All drawings processed.")
+            
+            st.subheader("📋 Itemized Takeoff Schedule")
             st.dataframe(
                 df_summary,
                 column_config={
-                    "Legend Icon": st.column_config.ImageColumn(
-                        "Legend Symbol", width="small"
-                    ),
-                    "Count": st.column_config.NumberColumn(
-                        "Verified Count", format="%d ⚡"
-                    ),
+                    "Legend Icon": st.column_config.ImageColumn("Legend Symbol", width="small"),
+                    "Count": st.column_config.NumberColumn("Verified Count", format="%d ⚡"),
                 },
                 use_container_width=True,
                 hide_index=True,
@@ -337,17 +338,12 @@ if process_btn:
                 )
             with col2:
                 st.download_button(
-                    label=" Download Takeoff Report (PDF)",
+                    label="📄 Download Takeoff Report (PDF)",
                     data=pdf_data,
                     file_name="DrBuild_Verified_Report.pdf",
                     mime="application/pdf",
                 )
         else:
-            st.warning(
-                "No elements were matched. Try adjusting the threshold or verify "
-                "that the legend section boundaries match your uploaded legend."
-            )
+            status_box.warning("No elements were matched. Try adjusting thresholds.")
 else:
-    st.info(
-        "Upload your legend sheet and optional drawing files in the sidebar to begin."
-    )
+    st.info("Upload your legend sheet and optional drawing files in the sidebar to begin.")
