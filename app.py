@@ -118,7 +118,7 @@ def run_strict_takeoff_module(legend_img, drawing_imgs, package_name, category_f
     for item in extracted_items:
         template = item["template"]
         total_count = 0
-        threshold = 0.82  # Strict matching threshold to minimize false positives
+        threshold = 0.50  # Strict matching threshold to minimize false positives
 
         for d_arr in cv_drawings:
             if (
