@@ -50,7 +50,7 @@ def load_image_safely(uploaded_file):
 def extract_electrical_symbols(legend_img, category_filter="All"):
     """
     Extracts electrical symbols using contour analysis.
-    Optimized for small legend symbols and robust text rejection.
+    OPTIMIZED: Relaxed filters to preserve complex symbols (circles with lines, arrows).
     """
     try:
         legend_cv = np.array(legend_img)
@@ -82,51 +82,34 @@ def extract_electrical_symbols(legend_img, category_filter="All"):
             area = cv2.contourArea(contour)
             
             # --- RELAXED SIZE FILTERS FOR SMALL LEGEND SYMBOLS ---
-            if area < 25: continue      # Lowered from 100
-            if w < 6 or h < 6: continue # Lowered from 15
-            if w > 120 or h > 120: continue # Max size to avoid text blocks
+            if area < 20: continue      # Very low threshold to catch small symbols
+            if w < 5 or h < 5: continue 
+            if w > 150 or h > 150: continue # Max size to avoid text blocks
             
             # Extract symbol region with padding
-            pad = 4
+            pad = 5
             sy1 = max(0, y - pad); sy2 = min(section.shape[0], y + h + pad)
             sx1 = max(0, x - pad); sx2 = min(section.shape[1], x + w + pad)
             symbol_crop = section[sy1:sy2, sx1:sx2]
             
-            # --- TEXT REJECTION LOGIC ---
+            # --- MINIMAL TEXT REJECTION (Preserves Complex Symbols) ---
             aspect_ratio = w / h
             density = area / max(1, w * h)
             is_text = False
             
             # 1. Extreme aspect ratios (thin letters like I, l or wide like -)
-            if aspect_ratio < 0.25 or aspect_ratio > 4.5:
+            # Complex symbols are usually roughly square or rectangular
+            if aspect_ratio < 0.2 or aspect_ratio > 5.0:
                 is_text = True
             
             # 2. Very low density + small area (likely punctuation or noise)
-            if density < 0.12 and area < 60:
+            # Complex symbols have wires/lines so they have decent density
+            if density < 0.08 and area < 50:
                 is_text = True
             
-            # 3. Hole detection for letters (P, O, D, B, R, A)
-            # Create a mask of just this contour to check internal holes efficiently
-            mask = np.zeros((h+2, w+2), np.uint8)
-            cv2.drawContours(mask, [contour - [x,y]], -1, 255, -1)
-            
-            # Flood fill from corner to find background
-            flood_mask = mask.copy()
-            cv2.floodFill(flood_mask, None, (0,0), 255)
-            
-            # Holes are pixels that are 0 in flood_mask but inside bounding box
-            hole_pixels = np.sum((flood_mask == 0))
-            bbox_area = w * h
-            hole_ratio = hole_pixels / max(1, bbox_area)
-            
-            # Letters like P/O/D have significant internal holes AND moderate density
-            if hole_ratio > 0.15 and density < 0.55 and aspect_ratio < 1.8:
-                # Verify it's not a complex symbol by checking polygon simplicity
-                epsilon = 0.05 * cv2.arcLength(contour, True)
-                approx = cv2.approxPolyDP(contour, epsilon, True)
-                # Letters tend to have fewer vertices than complex electrical symbols
-                if len(approx) <= 8: 
-                    is_text = True
+            # REMOVED: Aggressive hole detection. 
+            # Complex symbols (circle with line) have holes but ARE NOT text.
+            # We rely on shape matching later to distinguish them from letters.
             
             if is_text:
                 continue
@@ -164,7 +147,7 @@ def extract_electrical_symbols(legend_img, category_filter="All"):
 def match_symbols_by_shape(drawing_gray, symbol_templates, sensitivity=0.55):
     """
     Matches symbols in drawing using contour shape comparison (Hu Moments).
-    Much more robust than pixel template matching for electrical symbols.
+    This distinguishes complex symbols from letters based on geometry.
     """
     results = {tmpl["name"]: 0 for tmpl in symbol_templates}
     debug_matches = []
@@ -180,8 +163,8 @@ def match_symbols_by_shape(drawing_gray, symbol_templates, sensitivity=0.55):
         d_area = cv2.contourArea(d_contour)
         
         # Filter drawing contours by reasonable symbol size
-        if d_area < 30 or dw < 8 or dh < 8: continue
-        if dw > 250 or dh > 250: continue
+        if d_area < 20 or dw < 5 or dh < 5: continue
+        if dw > 300 or dh > 300: continue
         
         d_aspect = dw / max(1, dh)
         
@@ -198,6 +181,7 @@ def match_symbols_by_shape(drawing_gray, symbol_templates, sensitivity=0.55):
                 continue
             
             # Compare shapes using Hu Moments (scale/rotation invariant)
+            # CONTOURS_MATCH_I1 is best for complex shapes with holes
             score = cv2.matchShapes(d_contour, t_contour, cv2.CONTOURS_MATCH_I1, 0)
             similarity = 1.0 / (1.0 + score)
             
@@ -435,7 +419,7 @@ elif st.session_state.scan_complete:
     c.save()
 
     col1, col2 = st.columns(2)
-    with col1: st.download_button("📥 Excel (.xlsx)", excel_output.getvalue(), "DrBuild_Takeoff.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    with col1: st.download_button(" Excel (.xlsx)", excel_output.getvalue(), "DrBuild_Takeoff.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     with col2: st.download_button("📄 PDF Report", pdf_output.getvalue(), "DrBuild_Report.pdf", "application/pdf")
 
 else:
