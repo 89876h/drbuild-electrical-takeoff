@@ -3,10 +3,11 @@ import cv2
 import numpy as np
 import pandas as pd
 import streamlit as st
-from PIL import Image, ImageDraw
+from PIL import Image
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 import traceback
+import time
 
 # -----------------------------------------------------------------------------
 # 1. PAGE CONFIG & LAYOUT
@@ -109,7 +110,6 @@ def extract_symbols_from_legend(legend_img, category_filter):
 def multi_scale_match(drawing_gray, template, threshold, scales=None):
     """Tests multiple scales to handle size differences between legend and drawings."""
     if scales is None:
-        # Wide range of scales to catch significant size differences
         scales = [0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0, 2.5, 3.0]
     
     all_matches = []
@@ -130,27 +130,25 @@ def multi_scale_match(drawing_gray, template, threshold, scales=None):
         except Exception:
             continue
 
-    # Sort by score descending
     all_matches.sort(key=lambda x: -x[2])
     
-    # Deduplicate nearby matches
     filtered = []
     for pt, sc, score in all_matches:
         too_close = False
         for fm_pt, fm_sc, fm_score in filtered:
-            # Suppression radius should scale with template size
             suppression = max(15, int(20 * sc)) 
             if abs(pt[0] - fm_pt[0]) < suppression and abs(pt[1] - fm_pt[1]) < suppression:
                 too_close = True; break
         if not too_close:
             filtered.append((pt, sc, score))
             
-    return filtered, [m[0] for m in filtered[:10]] # Return top 10 for debug visualization
+    return filtered, [m[0] for m in filtered[:10]]
 
 def run_strict_takeoff_module_live(legend_img, drawing_imgs, package_name, category_filter, 
-                                   status_ph, metrics_ph, table_ph, accumulator, threshold, debug_mode):
-    """Live processing with debug visualization support."""
-    if not drawing_imgs or not legend_img: return
+                                   status_ph, metrics_ph, table_ph, accumulator, threshold, debug_mode,
+                                   global_progress_bar, global_status_log, total_drawings_global, current_global_idx):
+    """Live processing with persistent dashboard updates."""
+    if not drawing_imgs or not legend_img: return []
 
     valid_drawings = []
     for d_img in drawing_imgs:
@@ -163,21 +161,48 @@ def run_strict_takeoff_module_live(legend_img, drawing_imgs, package_name, categ
 
     if not valid_drawings:
         status_ph.warning(f"No valid drawings found for {package_name}")
-        return
+        return []
 
     extracted_items = extract_symbols_from_legend(legend_img, category_filter)
     if not extracted_items:
         status_ph.warning(f"No symbols detected for '{category_filter}'. Check legend section ratios.")
-        return
+        return []
 
     total_drawings = len(valid_drawings)
     cumulative_scanned = 0
     cumulative_matches = sum(item['Count'] for item in accumulator.values())
     
-    debug_images = [] # Store debug overlays
+    debug_images = []
     
+    # Initialize metrics display immediately
+    metrics_ph.markdown(
+        f"""
+        <div style="background-color:#f0f2f6; padding:15px; border-radius:8px; margin-bottom:10px;">
+            <div style="display:flex; justify-content:space-between; text-align:center;">
+                <div><div style="font-size:12px; color:#666;"> DRAWINGS SCANNED</div>
+                <div style="font-size:24px; font-weight:bold; color:#1f77b4;">0/{total_drawings}</div></div>
+                <div><div style="font-size:12px; color:#666;">⚡ TOTAL MATCHES FOUND</div>
+                <div style="font-size:24px; font-weight:bold; color:#2ca02c;">{cumulative_matches}</div></div>
+                <div><div style="font-size:12px; color:#666;">🔍 ACTIVE TEMPLATES</div>
+                <div style="font-size:24px; font-weight:bold; color:#ff7f0e;">{len(extracted_items)}</div></div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True
+    )
+    
+    status_ph.info(f"**Starting scan:** {package_name}\n**Templates loaded:** {len(extracted_items)}\n**Threshold:** {threshold}\n**Scales:** 0.3x-3.0x")
+
     for idx, d_arr in enumerate(valid_drawings, 1):
         drawing_matches = 0
+        
+        # Update global progress bar
+        current_global_idx[0] += 1
+        progress_pct = (current_global_idx[0] / total_drawings_global) * 100
+        global_progress_bar.progress(progress_pct / 100)
+        
+        # Update status log
+        log_msg = f"[{package_name}] Processing drawing {idx}/{total_drawings}..."
+        global_status_log.text(log_msg)
         
         for item in extracted_items:
             try:
@@ -197,7 +222,6 @@ def run_strict_takeoff_module_live(legend_img, drawing_imgs, package_name, categ
                 accumulator[symbol_key]["Count"] += count_increment
                 drawing_matches += count_increment
                 
-                # Collect debug points for this drawing
                 if debug_mode and debug_pts:
                     debug_images.append((d_arr.copy(), debug_pts, item["name"]))
                     
@@ -208,14 +232,14 @@ def run_strict_takeoff_module_live(legend_img, drawing_imgs, package_name, categ
         cumulative_scanned += 1
         cumulative_matches += drawing_matches
 
-        # Update Metrics Dashboard
+        # Update Metrics Dashboard (every drawing)
         metrics_ph.markdown(
             f"""
             <div style="background-color:#f0f2f6; padding:15px; border-radius:8px; margin-bottom:10px;">
                 <div style="display:flex; justify-content:space-between; text-align:center;">
-                    <div><div style="font-size:12px; color:#666;"> DRAWINGS SCANNED</div>
+                    <div><div style="font-size:12px; color:#666;">📄 DRAWINGS SCANNED</div>
                     <div style="font-size:24px; font-weight:bold; color:#1f77b4;">{cumulative_scanned}/{total_drawings}</div></div>
-                    <div><div style="font-size:12px; color:#666;">TOTAL MATCHES FOUND</div>
+                    <div><div style="font-size:12px; color:#666;">⚡ TOTAL MATCHES FOUND</div>
                     <div style="font-size:24px; font-weight:bold; color:#2ca02c;">{cumulative_matches}</div></div>
                     <div><div style="font-size:12px; color:#666;">🔍 ACTIVE TEMPLATES</div>
                     <div style="font-size:24px; font-weight:bold; color:#ff7f0e;">{len(extracted_items)}</div></div>
@@ -232,25 +256,34 @@ def run_strict_takeoff_module_live(legend_img, drawing_imgs, package_name, categ
         )
         status_ph.info(status_text)
 
-        # Update Table
-        if accumulator:
-            live_df = pd.DataFrame(list(accumulator.values()))
-            try:
-                table_ph.dataframe(live_df, column_config={
-                    "Legend Icon": st.column_config.ImageColumn("Legend Symbol", width="small"),
-                    "Count": st.column_config.NumberColumn("Verified Count", format="%d ⚡"),
-                }, use_container_width=True, hide_index=True)
-            except Exception:
-                table_ph.dataframe(live_df.drop(columns=["Legend Icon"], errors="ignore"))
+        # Update Table periodically (every 3 drawings or last one)
+        if idx % 3 == 0 or idx == total_drawings:
+            if accumulator:
+                live_df = pd.DataFrame(list(accumulator.values()))
+                try:
+                    table_ph.dataframe(live_df, column_config={
+                        "Legend Icon": st.column_config.ImageColumn("Legend Symbol", width="small"),
+                        "Count": st.column_config.NumberColumn("Verified Count", format="%d ⚡"),
+                    }, use_container_width=True, hide_index=True)
+                except Exception:
+                    table_ph.dataframe(live_df.drop(columns=["Legend Icon"], errors="ignore"))
                 
     return debug_images
 
 # -----------------------------------------------------------------------------
-# 3. MAIN EXECUTION LOGIC
+# 3. MAIN EXECUTION LOGIC WITH PERSISTENT DASHBOARD
 # -----------------------------------------------------------------------------
 if 'results_data' not in st.session_state: st.session_state.results_data = {}
 if 'scan_complete' not in st.session_state: st.session_state.scan_complete = False
 if 'debug_imgs' not in st.session_state: st.session_state.debug_imgs = []
+
+# Create persistent dashboard placeholders OUTSIDE the button block
+dashboard_container = st.container()
+status_box = dashboard_container.empty()
+metrics_box = dashboard_container.empty()
+progress_bar = dashboard_container.progress(0)
+status_log = dashboard_container.empty()
+table_box = dashboard_container.empty()
 
 if process_btn:
     st.session_state.results_data = {}
@@ -262,27 +295,32 @@ if process_btn:
     elif not power_files and not lighting_files:
         st.warning("Please upload at least one drawing file.")
     else:
-        status_box = st.empty()
-        metrics_box = st.empty()
-        table_box = st.empty()
-        
         try:
             legend_image = load_image_safely(legend_file)
             if not legend_image: st.stop()
 
             power_images = [load_image_safely(f) for f in (power_files or []) if load_image_safely(f)]
             lighting_images = [load_image_safely(f) for f in (lighting_files or []) if load_image_safely(f)]
+            
+            total_drawings = len(power_images) + len(lighting_images)
+            current_idx = [0]  # Mutable counter for global progress
 
             all_debug = []
             
             # Run Power Scan
-            dbg_p = run_strict_takeoff_module_live(legend_image, power_images, "Power Package", "Power / Devices", 
-                                                  status_box, metrics_box, table_box, st.session_state.results_data, match_threshold, debug_mode)
+            dbg_p = run_strict_takeoff_module_live(
+                legend_image, power_images, "Power Package", "Power / Devices", 
+                status_box, metrics_box, table_box, st.session_state.results_data, 
+                match_threshold, debug_mode, progress_bar, status_log, total_drawings, current_idx
+            )
             if dbg_p: all_debug.extend(dbg_p)
             
             # Run Lighting Scan  
-            dbg_l = run_strict_takeoff_module_live(legend_image, lighting_images, "Lighting Package", "Lighting", 
-                                                  status_box, metrics_box, table_box, st.session_state.results_data, match_threshold, debug_mode)
+            dbg_l = run_strict_takeoff_module_live(
+                legend_image, lighting_images, "Lighting Package", "Lighting", 
+                status_box, metrics_box, table_box, st.session_state.results_data, 
+                match_threshold, debug_mode, progress_bar, status_log, total_drawings, current_idx
+            )
             if dbg_l: all_debug.extend(dbg_l)
             
             st.session_state.debug_imgs = all_debug
@@ -296,13 +334,18 @@ if process_btn:
 elif st.session_state.scan_complete and st.session_state.results_data:
     df_summary = pd.DataFrame(list(st.session_state.results_data.values()))
     total_matches = sum(row['Count'] for row in st.session_state.results_data.values())
-    st.success(f"✅ SCAN COMPLETE! Total: {total_matches} verified matches.")
+    
+    # Clear scanning dashboard and show completion
+    status_box.success(f"✅ SCAN COMPLETE! Total: {total_matches} verified matches across {df_summary['Scan Package'].nunique()} packages.")
+    metrics_box.empty()  # Hide metrics after completion
+    progress_bar.empty()
+    status_log.empty()
     
     # Show Debug Visualizations if enabled
     if debug_mode and st.session_state.debug_imgs:
         st.subheader("🔍 Debug Visualization (Top Matches per Symbol)")
         cols = st.columns(3)
-        for i, (img_arr, pts, name) in enumerate(st.session_state.debug_imgs[:9]): # Show first 9
+        for i, (img_arr, pts, name) in enumerate(st.session_state.debug_imgs[:9]):
             vis_img = cv2.cvtColor(img_arr, cv2.COLOR_GRAY2RGB)
             for pt in pts:
                 cv2.rectangle(vis_img, pt, (pt[0]+20, pt[1]+20), (255, 0, 0), 2)
@@ -341,4 +384,10 @@ elif st.session_state.scan_complete and st.session_state.results_data:
     with col2: st.download_button(" Download PDF Report", pdf_output.getvalue(), "DrBuild_Report.pdf", "application/pdf")
 
 else:
+    # Initial state - hide dashboard elements
+    status_box.empty()
+    metrics_box.empty()
+    progress_bar.empty()
+    status_log.empty()
+    table_box.empty()
     st.info("Upload your legend sheet and optional drawing files in the sidebar to begin.")
