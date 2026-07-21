@@ -6,6 +6,7 @@ import streamlit as st
 from PIL import Image
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
+import traceback
 
 st.set_page_config(
     page_title="DrBuild Electrical Takeoff Tool", page_icon="⚡", layout="wide"
@@ -42,7 +43,7 @@ with st.sidebar:
 
 
 def load_image_safely(uploaded_file):
-    """Safely opens an uploaded image file, downscaling if dimensions exceed safe limits."""
+    """Safely opens an uploaded image file."""
     try:
         img = Image.open(uploaded_file).convert("RGB")
         if max(img.size) > 5000:
@@ -55,95 +56,105 @@ def load_image_safely(uploaded_file):
 
 def extract_symbols_from_legend(legend_img, category_filter):
     """Adaptive symbol extraction using connected components."""
-    legend_cv = np.array(legend_img)
-    gray = cv2.cvtColor(legend_cv, cv2.COLOR_RGB2GRAY)
-    h_leg, w_leg = gray.shape[:2]
+    try:
+        legend_cv = np.array(legend_img)
+        gray = cv2.cvtColor(legend_cv, cv2.COLOR_RGB2GRAY)
+        h_leg, w_leg = gray.shape[:2]
 
-    # Define section boundaries based on typical electrical legend layouts
-    if category_filter == "Power / Devices":
-        y_start = int(h_leg * 0.42)
-        y_end = int(h_leg * 0.62)
-    elif category_filter == "Lighting":
-        y_start = int(h_leg * 0.62)
-        y_end = int(h_leg * 0.78)
-    else:
-        y_start, y_end = 0, h_leg
+        # Define section boundaries based on typical electrical legend layouts
+        if category_filter == "Power / Devices":
+            y_start = int(h_leg * 0.42)
+            y_end = int(h_leg * 0.62)
+        elif category_filter == "Lighting":
+            y_start = int(h_leg * 0.62)
+            y_end = int(h_leg * 0.78)
+        else:
+            y_start, y_end = 0, h_leg
 
-    section = gray[y_start:y_end, :]
-    _, binary = cv2.threshold(section, 180, 255, cv2.THRESH_BINARY_INV)
-    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
-        binary, connectivity=8
-    )
-
-    extracted_items = []
-    item_counter = 1
-    prefix = "Device" if category_filter == "Power / Devices" else "Fixture"
-
-    for i in range(1, num_labels):
-        x, y, w, h, area = stats[i]
-        aspect_ratio = w / max(1, h)
-        if area < 30 or area > 5000:
-            continue
-        if aspect_ratio > 4.0 or aspect_ratio < 0.2:
-            continue
-        if w < 8 or h < 8:
-            continue
-
-        pad = 3
-        sy1 = max(0, y - pad)
-        sy2 = min(section.shape[0], y + h + pad)
-        sx1 = max(0, x - pad)
-        sx2 = min(section.shape[1], x + w + pad)
-
-        symbol_crop = section[sy1:sy2, sx1:sx2]
-        target_h = 40
-        scale = target_h / max(1, symbol_crop.shape[0])
-        new_w = max(10, int(symbol_crop.shape[1] * scale))
-        symbol_resized = cv2.resize(
-            symbol_crop, (new_w, target_h), interpolation=cv2.INTER_AREA
+        section = gray[y_start:y_end, :]
+        _, binary = cv2.threshold(section, 180, 255, cv2.THRESH_BINARY_INV)
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+            binary, connectivity=8
         )
 
-        pil_chip = Image.fromarray(symbol_resized)
-        img_byte_arr = io.BytesIO()
-        pil_chip.save(img_byte_arr, format="PNG")
+        extracted_items = []
+        item_counter = 1
+        prefix = "Device" if category_filter == "Power / Devices" else "Fixture"
 
-        extracted_items.append(
-            {
-                "category": category_filter,
-                "name": f"{prefix} Type {item_counter}",
-                "icon_bytes": img_byte_arr.getvalue(),
-                "template": symbol_resized,
-                "orig_size": (w, h),
-            }
-        )
-        item_counter += 1
+        for i in range(1, num_labels):
+            x, y, w, h, area = stats[i]
+            aspect_ratio = w / max(1, h)
+            if area < 30 or area > 5000:
+                continue
+            if aspect_ratio > 4.0 or aspect_ratio < 0.2:
+                continue
+            if w < 8 or h < 8:
+                continue
 
-    return extracted_items
+            pad = 3
+            sy1 = max(0, y - pad)
+            sy2 = min(section.shape[0], y + h + pad)
+            sx1 = max(0, x - pad)
+            sx2 = min(section.shape[1], x + w + pad)
+
+            symbol_crop = section[sy1:sy2, sx1:sx2]
+            target_h = 40
+            scale = target_h / max(1, symbol_crop.shape[0])
+            new_w = max(10, int(symbol_crop.shape[1] * scale))
+            symbol_resized = cv2.resize(
+                symbol_crop, (new_w, target_h), interpolation=cv2.INTER_AREA
+            )
+
+            pil_chip = Image.fromarray(symbol_resized)
+            img_byte_arr = io.BytesIO()
+            pil_chip.save(img_byte_arr, format="PNG")
+
+            extracted_items.append(
+                {
+                    "category": category_filter,
+                    "name": f"{prefix} Type {item_counter}",
+                    "icon_bytes": img_byte_arr.getvalue(),
+                    "template": symbol_resized,
+                }
+            )
+            item_counter += 1
+
+        return extracted_items
+    except Exception as e:
+        st.error(f"Legend extraction failed for {category_filter}: {str(e)}")
+        return []
 
 
 def multi_scale_match(drawing_gray, template, scales=(0.5, 0.7, 0.85, 1.0, 1.2, 1.5, 2.0), threshold=0.65):
-    """Multi-scale template matching with correct deduplication."""
+    """Multi-scale template matching with deduplication."""
     all_matches = []
+    
+    # Ensure template is valid
+    if template is None or template.size == 0:
+        return []
 
     for scale in scales:
-        scaled_template = cv2.resize(
-            template, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA
-        )
+        try:
+            scaled_template = cv2.resize(
+                template, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA
+            )
 
-        if (
-            scaled_template.shape[0] > drawing_gray.shape[0]
-            or scaled_template.shape[1] > drawing_gray.shape[1]
-        ):
+            if (
+                scaled_template.shape[0] > drawing_gray.shape[0]
+                or scaled_template.shape[1] > drawing_gray.shape[1]
+            ):
+                continue
+
+            res = cv2.matchTemplate(
+                drawing_gray, scaled_template, cv2.TM_CCOEFF_NORMED
+            )
+            loc = np.where(res >= threshold)
+            points = list(zip(*loc[::-1]))
+
+            for pt in points:
+                all_matches.append((pt, scale, float(res[pt[1], pt[0]])))
+        except Exception:
             continue
-
-        res = cv2.matchTemplate(
-            drawing_gray, scaled_template, cv2.TM_CCOEFF_NORMED
-        )
-        loc = np.where(res >= threshold)
-        points = list(zip(*loc[::-1]))
-
-        for pt in points:
-            all_matches.append((pt, scale, float(res[pt[1], pt[0]])))
 
     all_matches.sort(key=lambda x: -x[2])
 
@@ -160,31 +171,34 @@ def multi_scale_match(drawing_gray, template, scales=(0.5, 0.7, 0.85, 1.0, 1.2, 
     return filtered
 
 
-def run_strict_takeoff_module_live(legend_img, drawing_imgs, package_name, category_filter, status_placeholder, table_placeholder, existing_rows):
+def run_strict_takeoff_module_live(legend_img, drawing_imgs, package_name, category_filter, status_placeholder, table_placeholder, accumulator):
     """
     Performs strict computer vision extraction with LIVE UI updates.
-    Updates the status block and table after every single drawing is processed.
+    Uses a dictionary accumulator to safely track counts by symbol name.
     """
     if not drawing_imgs or not legend_img:
-        return pd.DataFrame()
+        return
 
     valid_drawings = []
     for d_img in drawing_imgs:
         if d_img is None:
             continue
-        d_arr = np.array(d_img)
-        if len(d_arr.shape) == 3:
-            d_arr = cv2.cvtColor(d_arr, cv2.COLOR_RGB2GRAY)
-        valid_drawings.append(d_arr)
+        try:
+            d_arr = np.array(d_img)
+            if len(d_arr.shape) == 3:
+                d_arr = cv2.cvtColor(d_arr, cv2.COLOR_RGB2GRAY)
+            valid_drawings.append(d_arr)
+        except Exception:
+            continue
 
     if not valid_drawings:
         status_placeholder.warning(f"No valid drawings found for {package_name}")
-        return pd.DataFrame()
+        return
 
     extracted_items = extract_symbols_from_legend(legend_img, category_filter)
     if not extracted_items:
         status_placeholder.warning(f"No symbols detected for '{category_filter}'.")
-        return pd.DataFrame()
+        return
 
     total_drawings = len(valid_drawings)
     
@@ -201,40 +215,42 @@ def run_strict_takeoff_module_live(legend_img, drawing_imgs, package_name, categ
 
         # Accumulate counts for each symbol
         for item in extracted_items:
-            matches = multi_scale_match(d_arr, item["template"], threshold=0.65)
-            
-            # Find or create row for this symbol
-            symbol_key = item["name"]
-            found = False
-            for row in existing_rows:
-                if row["Model / Description"] == symbol_key:
-                    row["Count"] += len(matches)
-                    found = True
-                    break
-            
-            if not found:
-                existing_rows.append({
-                    "System Category": item["category"],
-                    "Legend Icon": item["icon_bytes"],
-                    "Model / Description": symbol_key,
-                    "Scan Package": package_name,
-                    "Count": len(matches),
-                })
+            try:
+                matches = multi_scale_match(d_arr, item["template"], threshold=0.65)
+                symbol_key = item["name"]
+                
+                # Update accumulator dictionary
+                if symbol_key not in accumulator:
+                    accumulator[symbol_key] = {
+                        "System Category": item["category"],
+                        "Legend Icon": item["icon_bytes"],
+                        "Model / Description": symbol_key,
+                        "Scan Package": package_name,
+                        "Count": 0,
+                    }
+                
+                accumulator[symbol_key]["Count"] += len(matches)
+            except Exception as e:
+                # Log error but don't crash the app
+                print(f"Match error for {symbol_key}: {e}")
+                continue
 
         # Dynamically update the table placeholder
-        live_df = pd.DataFrame(existing_rows)
-        table_placeholder.dataframe(
-            live_df,
-            column_config={
-                "Legend Icon": st.column_config.ImageColumn("Legend Symbol", width="small"),
-                "Count": st.column_config.NumberColumn("Verified Count", format="%d ⚡"),
-            },
-            use_container_width=True,
-            hide_index=True,
-        )
-
-    return pd.DataFrame(existing_rows)
-
+        if accumulator:
+            live_df = pd.DataFrame(list(accumulator.values()))
+            try:
+                table_placeholder.dataframe(
+                    live_df,
+                    column_config={
+                        "Legend Icon": st.column_config.ImageColumn("Legend Symbol", width="small"),
+                        "Count": st.column_config.NumberColumn("Verified Count", format="%d ⚡"),
+                    },
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            except Exception:
+                # Fallback if image column fails
+                table_placeholder.dataframe(live_df.drop(columns=["Legend Icon"], errors="ignore"))
 
 if process_btn:
     if not legend_file:
@@ -246,104 +262,114 @@ if process_btn:
         status_box = st.empty()
         table_box = st.empty()
         
-        legend_image = load_image_safely(legend_file)
-        power_images = [load_image_safely(f) for f in (power_files or []) if load_image_safely(f)]
-        lighting_images = [load_image_safely(f) for f in (lighting_files or []) if load_image_safely(f)]
+        try:
+            legend_image = load_image_safely(legend_file)
+            if legend_image is None:
+                st.error("Failed to load legend image.")
+                st.stop()
 
-        # Shared list to accumulate results across packages
-        accumulated_rows = []
+            power_images = [load_image_safely(f) for f in (power_files or []) if load_image_safely(f)]
+            lighting_images = [load_image_safely(f) for f in (lighting_files or []) if load_image_safely(f)]
 
-        # Run Power Scan with Live Updates
-        df_power = run_strict_takeoff_module_live(
-            legend_image, power_images, "Power Package", "Power / Devices", 
-            status_box, table_box, accumulated_rows
-        )
-        
-        # Run Lighting Scan with Live Updates (continues accumulating)
-        df_lighting = run_strict_takeoff_module_live(
-            legend_image, lighting_images, "Lighting Package", "Lighting", 
-            status_box, table_box, accumulated_rows
-        )
+            # Shared dictionary accumulator
+            accumulated_data = {}
 
-        # Finalize
-        df_summary = pd.DataFrame(accumulated_rows) if accumulated_rows else pd.DataFrame()
-        
-        if not df_summary.empty:
-            status_box.success("✅ Strict takeoff scan complete! All drawings processed.")
+            # Run Power Scan with Live Updates
+            run_strict_takeoff_module_live(
+                legend_image, power_images, "Power Package", "Power / Devices", 
+                status_box, table_box, accumulated_data
+            )
             
-            st.subheader("📋 Itemized Takeoff Schedule")
-            st.dataframe(
-                df_summary,
-                column_config={
-                    "Legend Icon": st.column_config.ImageColumn("Legend Symbol", width="small"),
-                    "Count": st.column_config.NumberColumn("Verified Count", format="%d ⚡"),
-                },
-                use_container_width=True,
-                hide_index=True,
+            # Run Lighting Scan with Live Updates
+            run_strict_takeoff_module_live(
+                legend_image, lighting_images, "Lighting Package", "Lighting", 
+                status_box, table_box, accumulated_data
             )
 
-            # Excel Export
-            excel_output = io.BytesIO()
-            with pd.ExcelWriter(excel_output, engine="openpyxl") as writer:
-                df_summary.drop(columns=["Legend Icon"]).to_excel(
-                    writer, index=False, sheet_name="Takeoff Schedule"
+            # Finalize
+            df_summary = pd.DataFrame(list(accumulated_data.values())) if accumulated_data else pd.DataFrame()
+            
+            if not df_summary.empty:
+                status_box.success("✅ Strict takeoff scan complete! All drawings processed.")
+                
+                st.subheader("📋 Itemized Takeoff Schedule")
+                st.dataframe(
+                    df_summary,
+                    column_config={
+                        "Legend Icon": st.column_config.ImageColumn("Legend Symbol", width="small"),
+                        "Count": st.column_config.NumberColumn("Verified Count", format="%d ⚡"),
+                    },
+                    use_container_width=True,
+                    hide_index=True,
                 )
-            excel_data = excel_output.getvalue()
 
-            # PDF Report Generation
-            pdf_output = io.BytesIO()
-            c = canvas.Canvas(pdf_output, pagesize=letter)
-            width, height = letter
+                # Excel Export
+                excel_output = io.BytesIO()
+                with pd.ExcelWriter(excel_output, engine="openpyxl") as writer:
+                    df_summary.drop(columns=["Legend Icon"]).to_excel(
+                        writer, index=False, sheet_name="Takeoff Schedule"
+                    )
+                excel_data = excel_output.getvalue()
 
-            c.setFont("Helvetica-Bold", 16)
-            c.drawString(54, height - 50, "DrBuild LLC - Verified Takeoff Report")
-            c.setFont("Helvetica", 10)
-            c.drawString(54, height - 68, "Strict computer vision scan schedule.")
-            c.setLineWidth(1)
-            c.line(54, height - 78, width - 54, height - 78)
+                # PDF Report Generation
+                pdf_output = io.BytesIO()
+                c = canvas.Canvas(pdf_output, pagesize=letter)
+                width, height = letter
 
-            y = height - 105
-            c.setFont("Helvetica-Bold", 10)
-            c.drawString(54, y, "System Category")
-            c.drawString(180, y, "Model / Description")
-            c.drawString(380, y, "Package")
-            c.drawString(490, y, "Count")
-            y -= 15
-            c.setLineWidth(0.5)
-            c.line(54, y, width - 54, y)
-            y -= 20
+                c.setFont("Helvetica-Bold", 16)
+                c.drawString(54, height - 50, "DrBuild LLC - Verified Takeoff Report")
+                c.setFont("Helvetica", 10)
+                c.drawString(54, height - 68, "Strict computer vision scan schedule.")
+                c.setLineWidth(1)
+                c.line(54, height - 78, width - 54, height - 78)
 
-            c.setFont("Helvetica", 9)
-            for _, row in df_summary.iterrows():
-                if y < 50:
-                    c.showPage()
-                    y = height - 50
-                    c.setFont("Helvetica", 9)
-                c.drawString(54, y, str(row["System Category"]))
-                c.drawString(180, y, str(row["Model / Description"]))
-                c.drawString(380, y, str(row["Scan Package"]))
-                c.drawString(490, y, str(row["Count"]))
-                y -= 18
+                y = height - 105
+                c.setFont("Helvetica-Bold", 10)
+                c.drawString(54, y, "System Category")
+                c.drawString(180, y, "Model / Description")
+                c.drawString(380, y, "Package")
+                c.drawString(490, y, "Count")
+                y -= 15
+                c.setLineWidth(0.5)
+                c.line(54, y, width - 54, y)
+                y -= 20
 
-            c.save()
-            pdf_data = pdf_output.getvalue()
+                c.setFont("Helvetica", 9)
+                for _, row in df_summary.iterrows():
+                    if y < 50:
+                        c.showPage()
+                        y = height - 50
+                        c.setFont("Helvetica", 9)
+                    c.drawString(54, y, str(row["System Category"]))
+                    c.drawString(180, y, str(row["Model / Description"]))
+                    c.drawString(380, y, str(row["Scan Package"]))
+                    c.drawString(490, y, str(row["Count"]))
+                    y -= 18
 
-            col1, col2 = st.columns(2)
-            with col1:
-                st.download_button(
-                    label="📥 Export Takeoff to Excel (.xlsx)",
-                    data=excel_data,
-                    file_name="DrBuild_Verified_Takeoff.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
-            with col2:
-                st.download_button(
-                    label="📄 Download Takeoff Report (PDF)",
-                    data=pdf_data,
-                    file_name="DrBuild_Verified_Report.pdf",
-                    mime="application/pdf",
-                )
-        else:
-            status_box.warning("No elements were matched. Try adjusting thresholds.")
+                c.save()
+                pdf_data = pdf_output.getvalue()
+
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.download_button(
+                        label="📥 Export Takeoff to Excel (.xlsx)",
+                        data=excel_data,
+                        file_name="DrBuild_Verified_Takeoff.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+                with col2:
+                    st.download_button(
+                        label="📄 Download Takeoff Report (PDF)",
+                        data=pdf_data,
+                        file_name="DrBuild_Verified_Report.pdf",
+                        mime="application/pdf",
+                    )
+            else:
+                status_box.warning("No elements were matched. Try adjusting thresholds.")
+                
+        except Exception as e:
+            st.error(f"Critical Application Error: {str(e)}")
+            st.code(traceback.format_exc())
+
 else:
     st.info("Upload your legend sheet and optional drawing files in the sidebar to begin.")
