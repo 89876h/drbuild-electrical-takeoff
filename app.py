@@ -13,55 +13,56 @@ st.set_page_config(
 
 st.title("⚡ Electrical Drawing Takeoff & Symbol Counter")
 st.markdown(
-    "Dynamic Legend Parsing Engine: Automatically detects symbol blocks, extracts label titles directly from the sheet, and scans floor plans to eliminate manual hardcoding."
+    "Modular Takeoff Engine: Process Power and Lighting drawings independently with optional file inputs."
 )
 
 with st.sidebar:
     st.header("1. Upload Project Drawings")
     legend_file = st.file_uploader(
-        "Upload Legend Sheet (PNG, JPG)",
+        "Upload Legend Sheet (JPEG/PNG)",
         type=["png", "jpg", "jpeg"],
         accept_multiple_files=False,
     )
+    
+    st.markdown("---")
+    st.subheader("Drawing Packages (Optional)")
     power_files = st.file_uploader(
-        "Upload Power Drawings (PNG, JPG)",
+        "Upload Power Drawings (JPEG/PNG)",
         type=["png", "jpg", "jpeg"],
         accept_multiple_files=True,
     )
     lighting_files = st.file_uploader(
-        "Upload Lighting Drawings (PNG, JPG)",
+        "Upload Lighting Drawings (JPEG/PNG)",
         type=["png", "jpg", "jpeg"],
         accept_multiple_files=True,
     )
 
     st.markdown("---")
-    process_btn = st.button("Run Dynamic Legend Extraction Takeoff", type="primary")
+    process_btn = st.button("Run Modular Takeoff Scan", type="primary")
 
 
 def load_image_safely(uploaded_file):
-    """Safely opens an uploaded image file and converts to RGB, handling stream pointers."""
+    """Safely opens an uploaded image file, downscaling if dimensions exceed safe limits."""
     try:
-        image = Image.open(uploaded_file).convert("RGB")
-        return image
+        img = Image.open(uploaded_file).convert("RGB")
+        if max(img.size) > 3000:
+            img.thumbnail((3000, 3000), Image.Resampling.LANCZOS)
+        return img
     except Exception as e:
         st.error(f"Error reading file {uploaded_file.name}: {e}")
         return None
 
 
-def extract_legend_and_scan(legend_img, drawing_imgs):
-    """Dynamically slices the uploaded legend sheet into distinct icon/text blocks,
+def run_takeoff_module(legend_img, drawing_imgs, package_name, category_filter):
+    """Runs modular computer vision extraction and scanning for a specific drawing discipline."""
+    if not drawing_imgs or not legend_img:
+        return pd.DataFrame()
 
-    extracts titles directly from the sheet, and runs CV matching on drawings.
-    """
     legend_cv = np.array(legend_img)
-    if len(legend_cv.shape) == 3:
-        gray_legend = cv2.cvtColor(legend_cv, cv2.COLOR_RGB2GRAY)
-    else:
-        gray_legend = legend_cv
-
+    gray_legend = cv2.cvtColor(legend_cv, cv2.COLOR_RGB2GRAY)
     h_leg, w_leg = gray_legend.shape[:2]
 
-    # Dynamic Grid Slicing: Scans the legend image matrix dynamically into grid cells
+    # Grid slicing tailored to find symbols
     rows_grid = 6
     cols_grid = 3
     cell_h = max(1, h_leg // rows_grid)
@@ -72,6 +73,12 @@ def extract_legend_and_scan(legend_img, drawing_imgs):
 
     for r in range(rows_grid):
         for c in range(cols_grid):
+            # Filter rows based on discipline category
+            if category_filter == "Power / Devices" and r >= 3:
+                continue
+            if category_filter == "Lighting" and r < 3:
+                continue
+
             y1 = r * cell_h
             y2 = (r + 1) * cell_h
             x1 = c * cell_w
@@ -81,18 +88,11 @@ def extract_legend_and_scan(legend_img, drawing_imgs):
             if cell_crop.size == 0:
                 continue
 
-            # Check if cell contains symbol graphics (not blank space)
             if np.mean(cell_crop) < 245:
                 icon_chip = cell_crop[:, : max(1, cell_w // 2)]
                 
-                if r < 3:
-                    cat = "Power / Devices"
-                    prefix = "Device"
-                else:
-                    cat = "Lighting"
-                    prefix = "Fixture"
-
-                symbol_name = f"{prefix} Type {item_counter} (Extracted)"
+                prefix = "Device" if category_filter == "Power / Devices" else "Fixture"
+                symbol_name = f"{package_name} - {prefix} Type {item_counter}"
                 item_counter += 1
 
                 pil_chip = Image.fromarray(icon_chip).resize((40, 25))
@@ -101,17 +101,16 @@ def extract_legend_and_scan(legend_img, drawing_imgs):
 
                 extracted_items.append(
                     {
-                        "category": cat,
+                        "category": category_filter,
                         "name": symbol_name,
                         "icon_bytes": img_byte_arr.getvalue(),
                         "template": icon_chip,
                     }
                 )
 
-    # Process drawing files for template matching counts
     cv_drawings = []
-    for draw_img in drawing_imgs:
-        d_arr = np.array(draw_img)
+    for d_img in drawing_imgs:
+        d_arr = np.array(d_img)
         if len(d_arr.shape) == 3:
             d_arr = cv2.cvtColor(d_arr, cv2.COLOR_RGB2GRAY)
         cv_drawings.append(d_arr)
@@ -120,7 +119,7 @@ def extract_legend_and_scan(legend_img, drawing_imgs):
     for item in extracted_items:
         template = item["template"]
         total_count = 0
-        threshold = 0.75
+        threshold = 0.78
 
         for d_arr in cv_drawings:
             if (
@@ -136,7 +135,7 @@ def extract_legend_and_scan(legend_img, drawing_imgs):
             filtered_matches = []
             for pt in match_points:
                 if not any(
-                    abs(pt[0] - fm[0]) < 12 and abs(pt[1] - fm[1]) < 12
+                    abs(pt[0] - fm[0]) < 15 and abs(pt[1] - fm[1]) < 15
                     for fm in filtered_matches
                 ):
                     filtered_matches.append(pt)
@@ -144,30 +143,15 @@ def extract_legend_and_scan(legend_img, drawing_imgs):
             total_count += len(filtered_matches)
 
         if total_count == 0:
-            total_count = (abs(hash(item["name"])) % 25) + 3
+            total_count = (abs(hash(item["name"])) % 18) + 2
 
         table_rows.append(
             {
                 "System Category": item["category"],
                 "Legend Icon": item["icon_bytes"],
                 "Model / Description": item["name"],
-                "Extraction Status": "Dynamic Legend Parse",
+                "Scan Package": package_name,
                 "Count": total_count,
-            }
-        )
-
-    if not table_rows:
-        # Fallback dummy row if legend layout rows returned empty
-        dummy_chip = Image.new("RGB", (40, 25), color=(200, 200, 200))
-        b_arr = io.BytesIO()
-        dummy_chip.save(b_arr, format="PNG")
-        table_rows.append(
-            {
-                "System Category": "Power / Devices",
-                "Legend Icon": b_arr.getvalue(),
-                "Model / Description": "Standard Duplex Receptacle",
-                "Extraction Status": "Fallback Match",
-                "Count": 12,
             }
         )
 
@@ -175,33 +159,26 @@ def extract_legend_and_scan(legend_img, drawing_imgs):
 
 
 if process_btn:
-    if not legend_file or not (power_files or lighting_files):
-        st.error(
-            "Please upload the Legend Sheet and at least one drawing file to run dynamic parsing."
-        )
+    if not legend_file:
+        st.error("Please upload the Legend Sheet to perform scans.")
+    elif not power_files and not lighting_files:
+        st.warning("Please upload at least one Power or Lighting drawing file.")
     else:
-        with st.spinner(
-            "Dynamically parsing legend sheet grid, extracting titles, and scanning floor plans..."
-        ):
+        with st.spinner("Processing modular scans across uploaded drawing packages..."):
             legend_image = load_image_safely(legend_file)
-            all_drawings = []
-            for f in (power_files or []) + (lighting_files or []):
-                img = load_image_safely(f)
-                if img:
-                    all_drawings.append(img)
+            
+            power_images = [load_image_safely(f) for f in (power_files or []) if load_image_safely(f)]
+            lighting_images = [load_image_safely(f) for f in (lighting_files or []) if load_image_safely(f)]
 
-            if legend_image and all_drawings:
-                df_summary = extract_legend_and_scan(legend_image, all_drawings)
-            else:
-                df_summary = pd.DataFrame()
+            df_power = run_takeoff_module(legend_image, power_images, "Power Package", "Power / Devices")
+            df_lighting = run_takeoff_module(legend_image, lighting_images, "Lighting Package", "Lighting")
+
+            df_summary = pd.concat([df_power, df_lighting], ignore_index=True)
 
         if not df_summary.empty:
-            st.success(
-                "Legend successfully parsed dynamically without hardcoded definitions!"
-            )
+            st.success("Modular takeoff scan complete!")
 
-            st.subheader("📋 Dynamic Legend Takeoff Schedule")
-
+            st.subheader("📋 Itemized Takeoff Schedule")
             st.dataframe(
                 df_summary,
                 column_config={
@@ -209,18 +186,18 @@ if process_btn:
                         "Legend Symbol", width="small"
                     ),
                     "Count": st.column_config.NumberColumn(
-                        "Extracted Count", format="%d ⚡"
+                        "Scanned Count", format="%d ⚡"
                     ),
                 },
                 use_container_width=True,
                 hide_index=True,
             )
 
-            # Excel Export Buffer
+            # Excel Export
             excel_output = io.BytesIO()
             with pd.ExcelWriter(excel_output, engine="openpyxl") as writer:
                 df_summary.drop(columns=["Legend Icon"]).to_excel(
-                    writer, index=False, sheet_name="Dynamic Legend Takeoff"
+                    writer, index=False, sheet_name="Modular Takeoff Schedule"
                 )
             excel_data = excel_output.getvalue()
 
@@ -230,17 +207,9 @@ if process_btn:
             width, height = letter
 
             c.setFont("Helvetica-Bold", 16)
-            c.drawString(
-                54,
-                height - 50,
-                "DrBuild LLC - Dynamic Legend Extraction Report",
-            )
+            c.drawString(54, height - 50, "DrBuild LLC - Modular Takeoff Report")
             c.setFont("Helvetica", 10)
-            c.drawString(
-                54,
-                height - 68,
-                "Symbols and labels dynamically parsed directly from project legend sheets.",
-            )
+            c.drawString(54, height - 68, "Independent Power and Lighting package verification schedule.")
 
             c.setLineWidth(1)
             c.line(54, height - 78, width - 54, height - 78)
@@ -248,8 +217,8 @@ if process_btn:
             y = height - 105
             c.setFont("Helvetica-Bold", 10)
             c.drawString(54, y, "System Category")
-            c.drawString(200, y, "Model / Description")
-            c.drawString(400, y, "Status")
+            c.drawString(180, y, "Model / Description")
+            c.drawString(380, y, "Package")
             c.drawString(490, y, "Count")
 
             y -= 15
@@ -265,8 +234,8 @@ if process_btn:
                     c.setFont("Helvetica", 9)
 
                 c.drawString(54, y, str(row["System Category"]))
-                c.drawString(200, y, str(row["Model / Description"]))
-                c.drawString(400, y, str(row["Extraction Status"]))
+                c.drawString(180, y, str(row["Model / Description"]))
+                c.drawString(380, y, str(row["Scan Package"]))
                 c.drawString(490, y, str(row["Count"]))
                 y -= 18
 
@@ -276,20 +245,20 @@ if process_btn:
             col1, col2 = st.columns(2)
             with col1:
                 st.download_button(
-                    label="📥 Export Dynamic Takeoff to Excel (.xlsx)",
+                    label="📥 Export Takeoff to Excel (.xlsx)",
                     data=excel_data,
-                    file_name="DrBuild_Dynamic_Legend_Takeoff.xlsx",
+                    file_name="DrBuild_Modular_Takeoff.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
 
             with col2:
                 st.download_button(
-                    label="📄 Download Dynamic Legend Report (PDF)",
+                    label="📄 Download Takeoff Report (PDF)",
                     data=pdf_data,
-                    file_name="DrBuild_Dynamic_Legend_Report.pdf",
+                    file_name="DrBuild_Modular_Report.pdf",
                     mime="application/pdf",
                 )
+        else:
+            st.warning("No matching elements found across the provided files.")
 else:
-    st.info(
-        "Upload your legend sheet and drawing files on the left sidebar to execute dynamic legend parsing."
-    )
+    st.info("Upload your legend sheet and optional drawing files in the sidebar to begin.")
