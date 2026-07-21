@@ -13,7 +13,7 @@ st.set_page_config(
 
 st.title("⚡ Electrical Drawing Takeoff & Symbol Counter")
 st.markdown(
-    "Modular Takeoff Engine: Process Power and Lighting drawings independently with optional file inputs."
+    "Strict CV Takeoff Engine: Zero hardcoding, zero estimations. Only reports verified matches from drawing scans."
 )
 
 with st.sidebar:
@@ -38,7 +38,7 @@ with st.sidebar:
     )
 
     st.markdown("---")
-    process_btn = st.button("Run Modular Takeoff Scan", type="primary")
+    process_btn = st.button("Run Strict Takeoff Scan", type="primary")
 
 
 def load_image_safely(uploaded_file):
@@ -53,8 +53,8 @@ def load_image_safely(uploaded_file):
         return None
 
 
-def run_takeoff_module(legend_img, drawing_imgs, package_name, category_filter):
-    """Runs modular computer vision extraction and scanning for a specific drawing discipline."""
+def run_strict_takeoff_module(legend_img, drawing_imgs, package_name, category_filter):
+    """Performs strict computer vision extraction without fake fallback numbers."""
     if not drawing_imgs or not legend_img:
         return pd.DataFrame()
 
@@ -62,7 +62,6 @@ def run_takeoff_module(legend_img, drawing_imgs, package_name, category_filter):
     gray_legend = cv2.cvtColor(legend_cv, cv2.COLOR_RGB2GRAY)
     h_leg, w_leg = gray_legend.shape[:2]
 
-    # Grid slicing tailored to find symbols
     rows_grid = 6
     cols_grid = 3
     cell_h = max(1, h_leg // rows_grid)
@@ -73,7 +72,6 @@ def run_takeoff_module(legend_img, drawing_imgs, package_name, category_filter):
 
     for r in range(rows_grid):
         for c in range(cols_grid):
-            # Filter rows based on discipline category
             if category_filter == "Power / Devices" and r >= 3:
                 continue
             if category_filter == "Lighting" and r < 3:
@@ -88,6 +86,7 @@ def run_takeoff_module(legend_img, drawing_imgs, package_name, category_filter):
             if cell_crop.size == 0:
                 continue
 
+            # Only process cells that contain dark symbol lines (not blank white space)
             if np.mean(cell_crop) < 245:
                 icon_chip = cell_crop[:, : max(1, cell_w // 2)]
                 
@@ -119,7 +118,7 @@ def run_takeoff_module(legend_img, drawing_imgs, package_name, category_filter):
     for item in extracted_items:
         template = item["template"]
         total_count = 0
-        threshold = 0.78
+        threshold = 0.82  # Strict matching threshold to minimize false positives
 
         for d_arr in cv_drawings:
             if (
@@ -142,9 +141,7 @@ def run_takeoff_module(legend_img, drawing_imgs, package_name, category_filter):
 
             total_count += len(filtered_matches)
 
-        if total_count == 0:
-            total_count = (abs(hash(item["name"])) % 18) + 2
-
+        # STRICT ACCURACY: No fake fallbacks. If count is 0, it reports 0.
         table_rows.append(
             {
                 "System Category": item["category"],
@@ -164,19 +161,19 @@ if process_btn:
     elif not power_files and not lighting_files:
         st.warning("Please upload at least one Power or Lighting drawing file.")
     else:
-        with st.spinner("Processing modular scans across uploaded drawing packages..."):
+        with st.spinner("Executing strict computer vision scan across drawings..."):
             legend_image = load_image_safely(legend_file)
             
             power_images = [load_image_safely(f) for f in (power_files or []) if load_image_safely(f)]
             lighting_images = [load_image_safely(f) for f in (lighting_files or []) if load_image_safely(f)]
 
-            df_power = run_takeoff_module(legend_image, power_images, "Power Package", "Power / Devices")
-            df_lighting = run_takeoff_module(legend_image, lighting_images, "Lighting Package", "Lighting")
+            df_power = run_strict_takeoff_module(legend_image, power_images, "Power Package", "Power / Devices")
+            df_lighting = run_strict_takeoff_module(legend_image, lighting_images, "Lighting Package", "Lighting")
 
             df_summary = pd.concat([df_power, df_lighting], ignore_index=True)
 
         if not df_summary.empty:
-            st.success("Modular takeoff scan complete!")
+            st.success("Strict takeoff scan complete!")
 
             st.subheader("📋 Itemized Takeoff Schedule")
             st.dataframe(
@@ -186,7 +183,7 @@ if process_btn:
                         "Legend Symbol", width="small"
                     ),
                     "Count": st.column_config.NumberColumn(
-                        "Scanned Count", format="%d ⚡"
+                        "Verified Count", format="%d ⚡"
                     ),
                 },
                 use_container_width=True,
@@ -197,7 +194,7 @@ if process_btn:
             excel_output = io.BytesIO()
             with pd.ExcelWriter(excel_output, engine="openpyxl") as writer:
                 df_summary.drop(columns=["Legend Icon"]).to_excel(
-                    writer, index=False, sheet_name="Modular Takeoff Schedule"
+                    writer, index=False, sheet_name="Takeoff Schedule"
                 )
             excel_data = excel_output.getvalue()
 
@@ -207,9 +204,9 @@ if process_btn:
             width, height = letter
 
             c.setFont("Helvetica-Bold", 16)
-            c.drawString(54, height - 50, "DrBuild LLC - Modular Takeoff Report")
+            c.drawString(54, height - 50, "DrBuild LLC - Verified Takeoff Report")
             c.setFont("Helvetica", 10)
-            c.drawString(54, height - 68, "Independent Power and Lighting package verification schedule.")
+            c.drawString(54, height - 68, "Strict computer vision scan schedule.")
 
             c.setLineWidth(1)
             c.line(54, height - 78, width - 54, height - 78)
@@ -247,7 +244,7 @@ if process_btn:
                 st.download_button(
                     label="📥 Export Takeoff to Excel (.xlsx)",
                     data=excel_data,
-                    file_name="DrBuild_Modular_Takeoff.xlsx",
+                    file_name="DrBuild_Verified_Takeoff.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
 
@@ -255,10 +252,10 @@ if process_btn:
                 st.download_button(
                     label="📄 Download Takeoff Report (PDF)",
                     data=pdf_data,
-                    file_name="DrBuild_Modular_Report.pdf",
+                    file_name="DrBuild_Verified_Report.pdf",
                     mime="application/pdf",
                 )
         else:
-            st.warning("No matching elements found across the provided files.")
+            st.warning("No elements were matched with the strict threshold.")
 else:
     st.info("Upload your legend sheet and optional drawing files in the sidebar to begin.")
