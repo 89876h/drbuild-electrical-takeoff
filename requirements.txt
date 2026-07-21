@@ -1,7 +1,2 @@
-streamlit
-pandas
-reportlab
-opencv-python-headless
-numpy
-Pillow
-PyMuPDF
+opencv-python>=4.5.0
+numpy>=1.19.0
