@@ -14,7 +14,7 @@ import traceback
 st.set_page_config(page_title="DrBuild Electrical Takeoff Tool", page_icon="⚡", layout="wide")
 
 st.title("⚡ Electrical Drawing Takeoff & Symbol Counter")
-st.markdown("Feature-based symbol detection with shape analysis.")
+st.markdown("Multi-scale template matching with text removal and rotation support.")
 
 with st.sidebar:
     st.header("1. Upload Project Drawings")
@@ -27,12 +27,12 @@ with st.sidebar:
     
     st.markdown("---")
     st.subheader("Detection Settings")
-    sensitivity = st.slider("Match Sensitivity", 0.3, 0.9, 0.55, 0.05, help="Lower = more matches but more false positives")
-    debug_mode = st.checkbox("Show Debug Visualization", value=False)
+    match_threshold = st.slider("Match Threshold", 0.50, 0.95, 0.65, 0.05)
+    debug_mode = st.checkbox("Show Debug Matches", value=False)
     
     st.markdown("---")
-    preview_btn = st.button("🔍 Preview Extracted Symbols", type="secondary")
-    process_btn = st.button("▶️ Start Symbol Detection", type="primary")
+    preview_btn = st.button("🔍 Preview Symbols", type="secondary")
+    process_btn = st.button("▶️ Run Takeoff Scan", type="primary")
 
 # -----------------------------------------------------------------------------
 # 2. HELPER FUNCTIONS
@@ -47,170 +47,151 @@ def load_image_safely(uploaded_file):
         st.error(f"Error reading {uploaded_file.name}: {e}")
         return None
 
-def extract_electrical_symbols(legend_img, category_filter="All"):
+def remove_text_from_legend(gray_img):
     """
-    Extracts electrical symbols using contour analysis.
-    OPTIMIZED: Relaxed filters to preserve complex symbols (circles with lines, arrows).
+    Removes text while preserving electrical symbols.
+    Text is typically thinner and more linear than symbols.
+    Uses morphological closing to connect symbol parts, then subtracts thin structures.
     """
-    try:
-        legend_cv = np.array(legend_img)
-        gray = cv2.cvtColor(legend_cv, cv2.COLOR_RGB2GRAY)
-        h_leg, w_leg = gray.shape[:2]
+    # Adaptive threshold for better handling of faded scans
+    binary = cv2.adaptiveThreshold(gray_img, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                   cv2.THRESH_BINARY_INV, 11, 2)
+    
+    # Create a mask of "thin" structures (likely text)
+    # Horizontal and vertical line detection
+    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 1))
+    v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 15))
+    
+    h_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, h_kernel)
+    v_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, v_kernel)
+    text_mask = cv2.bitwise_or(h_lines, v_lines)
+    
+    # Dilate text mask slightly to catch serifs and adjacent pixels
+    text_mask = cv2.dilate(text_mask, np.ones((2,2), np.uint8), iterations=1)
+    
+    # Remove text from binary image
+    cleaned = cv2.bitwise_and(binary, cv2.bitwise_not(text_mask))
+    
+    # Clean up noise with small opening
+    kernel = np.ones((2,2), np.uint8)
+    cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, kernel)
+    
+    return cleaned
 
-        # Define section boundaries
-        if category_filter == "Power / Devices":
-            y_start, y_end = int(h_leg * 0.42), int(h_leg * 0.62)
-        elif category_filter == "Lighting":
-            y_start, y_end = int(h_leg * 0.62), int(h_leg * 0.78)
-        else:
-            y_start, y_end = 0, h_leg
+def extract_symbols_from_cleaned_legend(cleaned_binary, category_filter="All"):
+    """
+    Extracts symbols from text-removed legend using connected components.
+    Since text is gone, we can use simpler size filters.
+    """
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(cleaned_binary, connectivity=8)
+    
+    symbols = []
+    item_counter = 1
+    prefix = "Device" if category_filter == "Power / Devices" else "Fixture"
+    
+    for i in range(1, num_labels):
+        x, y, w, h, area = stats[i]
+        
+        # Size filters (text is already removed, so these catch symbols)
+        if area < 30 or w < 8 or h < 8: continue
+        if w > 150 or h > 150: continue  # Skip large remaining artifacts
+        
+        # Extract with padding
+        pad = 5
+        sy1 = max(0, y-pad); sy2 = min(cleaned_binary.shape[0], y+h+pad)
+        sx1 = max(0, x-pad); sx2 = min(cleaned_binary.shape[1], x+w+pad)
+        symbol_crop = cleaned_binary[sy1:sy2, sx1:sx2]
+        
+        # Normalize to standard size for template matching
+        target_h = 50
+        scale = target_h / max(1, h)
+        new_w = max(15, int(w * scale))
+        symbol_resized = cv2.resize(symbol_crop, (new_w, target_h), interpolation=cv2.INTER_AREA)
+        
+        pil_chip = Image.fromarray(symbol_resized)
+        img_byte_arr = io.BytesIO()
+        pil_chip.save(img_byte_arr, format="PNG")
+        
+        symbols.append({
+            "category": category_filter,
+            "name": f"{prefix} Type {item_counter}",
+            "icon_bytes": img_byte_arr.getvalue(),
+            "template": symbol_resized,
+            "orig_size": (w, h)
+        })
+        item_counter += 1
+    
+    return symbols
 
-        section = gray[y_start:y_end, :]
+def multi_scale_rotate_match(drawing_gray, template, threshold, scales=None, rotations=None):
+    """
+    Multi-scale, multi-rotation template matching with non-maximum suppression.
+    """
+    if scales is None: scales = [0.3, 0.5, 0.7, 1.0, 1.5, 2.0]
+    if rotations is None: rotations = [0, 90, 180, 270]
+    
+    all_matches = []
+    
+    for scale in scales:
+        scaled_template = cv2.resize(template, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
         
-        # Threshold to binary (symbols are dark on white)
-        _, binary = cv2.threshold(section, 180, 255, cv2.THRESH_BINARY_INV)
-        
-        # Find external contours only
-        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        extracted_symbols = []
-        item_counter = 1
-        prefix = "Device" if category_filter == "Power / Devices" else "Fixture"
-        
-        for contour in contours:
-            x, y, w, h = cv2.boundingRect(contour)
-            area = cv2.contourArea(contour)
+        for angle in rotations:
+            if angle == 0:
+                rotated = scaled_template
+            else:
+                h, w = scaled_template.shape[:2]
+                center = (w//2, h//2)
+                M = cv2.getRotationMatrix2D(center, angle, 1.0)
+                rotated = cv2.warpAffine(scaled_template, M, (w, h), borderValue=0)
             
-            # --- RELAXED SIZE FILTERS FOR SMALL LEGEND SYMBOLS ---
-            if area < 20: continue      # Very low threshold to catch small symbols
-            if w < 5 or h < 5: continue 
-            if w > 150 or h > 150: continue # Max size to avoid text blocks
-            
-            # Extract symbol region with padding
-            pad = 5
-            sy1 = max(0, y - pad); sy2 = min(section.shape[0], y + h + pad)
-            sx1 = max(0, x - pad); sx2 = min(section.shape[1], x + w + pad)
-            symbol_crop = section[sy1:sy2, sx1:sx2]
-            
-            # --- MINIMAL TEXT REJECTION (Preserves Complex Symbols) ---
-            aspect_ratio = w / h
-            density = area / max(1, w * h)
-            is_text = False
-            
-            # 1. Extreme aspect ratios (thin letters like I, l or wide like -)
-            # Complex symbols are usually roughly square or rectangular
-            if aspect_ratio < 0.2 or aspect_ratio > 5.0:
-                is_text = True
-            
-            # 2. Very low density + small area (likely punctuation or noise)
-            # Complex symbols have wires/lines so they have decent density
-            if density < 0.08 and area < 50:
-                is_text = True
-            
-            # REMOVED: Aggressive hole detection. 
-            # Complex symbols (circle with line) have holes but ARE NOT text.
-            # We rely on shape matching later to distinguish them from letters.
-            
-            if is_text:
+            # Skip if template larger than drawing
+            if rotated.shape[0] > drawing_gray.shape[0] or rotated.shape[1] > drawing_gray.shape[1]:
                 continue
             
-            # --- NORMALIZE SYMBOL FOR DISPLAY & MATCHING ---
-            target_size = 60
-            scale = target_size / max(w, h)
-            new_w = max(15, int(w * scale))
-            new_h = max(15, int(h * scale))
+            res = cv2.matchTemplate(drawing_gray, rotated, cv2.TM_CCOEFF_NORMED)
+            loc = np.where(res >= threshold)
+            points = list(zip(*loc[::-1]))
             
-            symbol_resized = cv2.resize(symbol_crop, (new_w, new_h), interpolation=cv2.INTER_AREA)
-            
-            pil_chip = Image.fromarray(symbol_resized)
-            img_byte_arr = io.BytesIO()
-            pil_chip.save(img_byte_arr, format="PNG")
-            
-            extracted_symbols.append({
-                "category": category_filter,
-                "name": f"{prefix} Type {item_counter}",
-                "icon_bytes": img_byte_arr.getvalue(),
-                "template": symbol_resized,
-                "contour": contour, # Keep original contour for shape matching
-                "bbox": (x, y, w, h),
-            })
-            item_counter += 1
-        
-        print(f"✅ Extracted {len(extracted_symbols)} symbols from '{category_filter}' section")
-        return extracted_symbols
-        
-    except Exception as e:
-        st.error(f"Symbol extraction failed: {str(e)}")
-        traceback.print_exc()
-        return []
-
-def match_symbols_by_shape(drawing_gray, symbol_templates, sensitivity=0.55):
-    """
-    Matches symbols in drawing using contour shape comparison (Hu Moments).
-    This distinguishes complex symbols from letters based on geometry.
-    """
-    results = {tmpl["name"]: 0 for tmpl in symbol_templates}
-    debug_matches = []
+            for pt in points:
+                score = float(res[pt[1], pt[0]])
+                all_matches.append((pt, score, scale, angle))
     
-    # Threshold drawing
-    _, drawing_binary = cv2.threshold(drawing_gray, 180, 255, cv2.THRESH_BINARY_INV)
+    # Non-maximum suppression
+    all_matches.sort(key=lambda x: -x[1])
+    filtered = []
+    for pt, score, sc, ang in all_matches:
+        too_close = False
+        for fm_pt, fm_score, fm_sc, fm_ang in filtered:
+            suppression = max(10, int(15 * sc))
+            if abs(pt[0] - fm_pt[0]) < suppression and abs(pt[1] - fm_pt[1]) < suppression:
+                too_close = True
+                break
+        if not too_close:
+            filtered.append((pt, score, sc, ang))
     
-    # Find contours in drawing
-    drawing_contours, _ = cv2.findContours(drawing_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    for d_contour in drawing_contours:
-        dx, dy, dw, dh = cv2.boundingRect(d_contour)
-        d_area = cv2.contourArea(d_contour)
-        
-        # Filter drawing contours by reasonable symbol size
-        if d_area < 20 or dw < 5 or dh < 5: continue
-        if dw > 300 or dh > 300: continue
-        
-        d_aspect = dw / max(1, dh)
-        
-        best_match_name = None
-        best_score = 0 # Higher is better (similarity)
-        
-        for tmpl in symbol_templates:
-            t_contour = tmpl["contour"]
-            tx, ty, tw, th = tmpl["bbox"]
-            t_aspect = tw / max(1, th)
-            
-            # Quick aspect ratio filter (must be within 60% similarity)
-            if abs(d_aspect - t_aspect) / max(d_aspect, t_aspect, 0.1) > 0.6:
-                continue
-            
-            # Compare shapes using Hu Moments (scale/rotation invariant)
-            # CONTOURS_MATCH_I1 is best for complex shapes with holes
-            score = cv2.matchShapes(d_contour, t_contour, cv2.CONTOURS_MATCH_I1, 0)
-            similarity = 1.0 / (1.0 + score)
-            
-            if similarity > best_score:
-                best_score = similarity
-                best_match_name = tmpl["name"]
-        
-        # If we found a good match above sensitivity threshold
-        if best_score > sensitivity and best_match_name:
-            results[best_match_name] += 1
-            
-            if debug_mode:
-                debug_matches.append((dx, dy, dw, dh, best_match_name, best_score))
-    
-    return results, debug_matches
+    return filtered
 
 # -----------------------------------------------------------------------------
 # 3. PREVIEW SECTION
 # -----------------------------------------------------------------------------
 if legend_file and preview_btn:
-    with st.spinner("Extracting symbols from legend..."):
+    with st.spinner("Processing legend (removing text + extracting symbols)..."):
         legend_img = load_image_safely(legend_file)
         if legend_img:
-            symbols = extract_electrical_symbols(legend_img, "All")
+            gray = cv2.cvtColor(np.array(legend_img), cv2.COLOR_RGB2GRAY)
+            cleaned = remove_text_from_legend(gray)
+            
+            # Show before/after
+            col1, col2 = st.columns(2)
+            with col1: st.image(gray, caption="Original Legend", use_column_width=True)
+            with col2: st.image(cleaned, caption="After Text Removal", use_column_width=True)
+            
+            symbols = extract_symbols_from_cleaned_legend(cleaned, "All")
             
             if symbols:
-                st.success(f"✅ Found {len(symbols)} electrical symbols (text filtered out)")
+                st.success(f"✅ Extracted {len(symbols)} symbols (text removed)")
                 
-                st.subheader("️ Extracted Symbols Preview")
+                st.subheader("🖼️ Extracted Symbols")
                 cols = st.columns(6)
                 for idx, sym in enumerate(symbols):
                     col = cols[idx % 6]
@@ -218,14 +199,15 @@ if legend_file and preview_btn:
                         st.image(sym["icon_bytes"], caption=sym['name'], use_column_width=True)
                 
                 st.session_state.extracted_symbols = symbols
-                st.info("Symbols saved! Upload drawings and click 'Start Symbol Detection'.")
+                st.session_state.cleaned_legend = cleaned
+                st.info("Symbols saved! Upload drawings and click 'Run Takeoff Scan'.")
             else:
-                st.warning("No symbols detected. Try adjusting image quality or thresholds.")
+                st.warning("No symbols found after text removal. Check legend quality.")
         else:
-            st.error("Failed to load legend image.")
+            st.error("Failed to load legend.")
 
 # -----------------------------------------------------------------------------
-# 4. MAIN PROCESSING WITH LIVE PROGRESS
+# 4. MAIN PROCESSING
 # -----------------------------------------------------------------------------
 if 'results_data' not in st.session_state: st.session_state.results_data = {}
 if 'scan_complete' not in st.session_state: st.session_state.scan_complete = False
@@ -255,14 +237,16 @@ if process_btn:
             
             total_drawings = len(power_images) + len(lighting_images)
             
-            # Get symbols (reuse preview if available)
+            # Get symbols
             if hasattr(st.session_state, 'extracted_symbols') and st.session_state.extracted_symbols:
                 symbols = st.session_state.extracted_symbols
             else:
-                with st.spinner("Extracting symbols from legend..."):
-                    symbols = extract_electrical_symbols(legend_image, "All")
+                with st.spinner("Processing legend..."):
+                    gray = cv2.cvtColor(np.array(legend_image), cv2.COLOR_RGB2GRAY)
+                    cleaned = remove_text_from_legend(gray)
+                    symbols = extract_symbols_from_cleaned_legend(cleaned, "All")
                 if not symbols:
-                    st.warning("No symbols found in legend."); st.stop()
+                    st.warning("No symbols found."); st.stop()
 
             # Initialize accumulator
             accumulator = {
@@ -276,19 +260,19 @@ if process_btn:
                 for sym in symbols
             }
 
-            # Initial dashboard state
+            # Initial dashboard
             metrics_box.markdown(
                 f"""<div style="background:#f0f2f6;padding:15px;border-radius:8px;margin-bottom:10px;">
                 <div style="display:flex;justify-content:space-between;text-align:center;">
                 <div><div style="font-size:12px;color:#666;">DRAWINGS SCANNED</div>
                 <div style="font-size:24px;font-weight:bold;color:#1f77b4;">0/{total_drawings}</div></div>
-                <div><div style="font-size:12px;color:#666;">⚡ SYMBOLS FOUND</div>
+                <div><div style="font-size:12px;color:#666;"> SYMBOLS FOUND</div>
                 <div style="font-size:24px;font-weight:bold;color:#2ca02c;">0</div></div>
                 <div><div style="font-size:12px;color:#666;">TEMPLATES</div>
                 <div style="font-size:24px;font-weight:bold;color:#ff7f0e;">{len(symbols)}</div></div>
                 </div></div>""", unsafe_allow_html=True
             )
-            status_box.info(f"Starting detection...\nTemplates: {len(symbols)}\nSensitivity: {sensitivity}")
+            status_box.info(f"Starting scan...\nTemplates: {len(symbols)}\nThreshold: {match_threshold}")
 
             drawing_idx = 0
             total_matches = 0
@@ -304,13 +288,21 @@ if process_btn:
                 status_log.text(f"[Power] Processing drawing {idx+1}/{len(power_images)}...")
                 progress_bar.progress(pct / 100)
                 
-                matches, _ = match_symbols_by_shape(d_arr, symbols, sensitivity)
-                
                 drawing_count = 0
-                for name, count in matches.items():
-                    if name in accumulator:
-                        accumulator[name]["Count"] += count
-                        drawing_count += count
+                for sym in symbols:
+                    matches = multi_scale_rotate_match(d_arr, sym["template"], match_threshold)
+                    count = len(matches)
+                    accumulator[sym["name"]]["Count"] += count
+                    drawing_count += count
+                    
+                    if debug_mode and matches:
+                        vis = cv2.cvtColor(d_arr, cv2.COLOR_GRAY2RGB)
+                        for pt, score, sc, ang in matches[:5]:
+                            th, tw = sym["template"].shape
+                            scaled_tw = int(tw * sc)
+                            scaled_th = int(th * sc)
+                            cv2.rectangle(vis, pt, (pt[0]+scaled_tw, pt[1]+scaled_th), (0,255,0), 2)
+                        st.image(vis, caption=f"{sym['name']} - {count} matches", use_column_width=True)
                 
                 total_matches += drawing_count
                 
@@ -330,10 +322,10 @@ if process_btn:
                     live_df = pd.DataFrame(list(accumulator.values()))
                     table_box.dataframe(live_df, column_config={
                         "Legend Icon": st.column_config.ImageColumn("Symbol", width="small"),
-                        "Count": st.column_config.NumberColumn("Count", format="%d ⚡"),
+                        "Count": st.column_config.NumberColumn("Count", format="%d "),
                     }, use_container_width=True, hide_index=True)
 
-            # Process Lighting Drawings
+            # Process Lighting Drawings (same pattern)
             for idx, d_img in enumerate(lighting_images):
                 d_arr = np.array(d_img)
                 if len(d_arr.shape) == 3: d_arr = cv2.cvtColor(d_arr, cv2.COLOR_RGB2GRAY)
@@ -344,13 +336,12 @@ if process_btn:
                 status_log.text(f"[Lighting] Processing drawing {idx+1}/{len(lighting_images)}...")
                 progress_bar.progress(pct / 100)
                 
-                matches, _ = match_symbols_by_shape(d_arr, symbols, sensitivity)
-                
                 drawing_count = 0
-                for name, count in matches.items():
-                    if name in accumulator:
-                        accumulator[name]["Count"] += count
-                        drawing_count += count
+                for sym in symbols:
+                    matches = multi_scale_rotate_match(d_arr, sym["template"], match_threshold)
+                    count = len(matches)
+                    accumulator[sym["name"]]["Count"] += count
+                    drawing_count += count
                 
                 total_matches += drawing_count
                 
@@ -386,7 +377,7 @@ elif st.session_state.scan_complete:
     df_summary = pd.DataFrame(list(st.session_state.results_data.values()))
     total_matches = sum(row['Count'] for row in st.session_state.results_data.values())
     
-    status_box.success(f"✅ COMPLETE! {total_matches} symbols detected across all drawings.")
+    status_box.success(f"✅ COMPLETE! {total_matches} symbols detected.")
     metrics_box.empty(); progress_bar.empty(); status_log.empty()
 
     st.subheader("📋 Symbol Takeoff Schedule")
@@ -425,4 +416,4 @@ elif st.session_state.scan_complete:
 else:
     status_box.empty(); metrics_box.empty(); progress_bar.empty(); status_log.empty(); table_box.empty()
     st.info("Upload legend and drawings to begin.")
-    st.caption("💡 Click 'Preview Extracted Symbols' first to verify detection before scanning.")
+    st.caption("💡 Click 'Preview Symbols' to see text removal results before scanning.")
