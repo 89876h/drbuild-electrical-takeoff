@@ -32,10 +32,12 @@ with st.sidebar:
     debug_mode = st.checkbox("Show Debug Matches", value=False, help="Visualize where symbols were detected on drawings")
     
     st.markdown("---")
-    process_btn = st.button("Run Strict Takeoff Scan", type="primary")
+    # Two buttons: one to preview templates, one to start scan
+    preview_btn = st.button("🔍 Preview Legend Templates", type="secondary")
+    process_btn = st.button("🚀 Start Strict Takeoff Scan", type="primary")
 
 # -----------------------------------------------------------------------------
-# 2. HELPER FUNCTIONS
+# 2. HELPER FUNCTIONS (unchanged from previous version)
 # -----------------------------------------------------------------------------
 def load_image_safely(uploaded_file):
     try:
@@ -47,14 +49,14 @@ def load_image_safely(uploaded_file):
         st.error(f"Error reading {uploaded_file.name}: {e}")
         return None
 
-def extract_symbols_from_legend(legend_img, category_filter):
-    """Extracts symbol blobs using connected components with strict size filtering."""
+def extract_symbols_from_legend(legend_img, category_filter="All"):
+    """Extracts symbol blobs using connected components."""
     try:
         legend_cv = np.array(legend_img)
         gray = cv2.cvtColor(legend_cv, cv2.COLOR_RGB2GRAY)
         h_leg, w_leg = gray.shape[:2]
 
-        # Section boundaries - adjust these ratios based on your specific legend layout
+        # If 'All', use full legend; otherwise use section-based cropping
         if category_filter == "Power / Devices":
             y_start, y_end = int(h_leg * 0.42), int(h_leg * 0.62)
         elif category_filter == "Lighting":
@@ -74,18 +76,15 @@ def extract_symbols_from_legend(legend_img, category_filter):
             x, y, w, h, area = stats[i]
             aspect_ratio = w / max(1, h)
             
-            # Strict filtering to exclude text and noise
             if area < 40 or area > 8000: continue
             if aspect_ratio > 5.0 or aspect_ratio < 0.15: continue
             if w < 10 or h < 10: continue
             
-            # Extract with padding
             pad = 4
             sy1, sy2 = max(0, y-pad), min(section.shape[0], y+h+pad)
             sx1, sx2 = max(0, x-pad), min(section.shape[1], x+w+pad)
             symbol_crop = section[sy1:sy2, sx1:sx2]
 
-            # Normalize to standard height for consistent processing
             target_h = 50
             scale = target_h / max(1, symbol_crop.shape[0])
             new_w = max(15, int(symbol_crop.shape[1] * scale))
@@ -100,6 +99,7 @@ def extract_symbols_from_legend(legend_img, category_filter):
                 "name": f"{prefix} Type {item_counter}",
                 "icon_bytes": img_byte_arr.getvalue(),
                 "template": symbol_resized,
+                "orig_bbox": (x, y, w, h),
             })
             item_counter += 1
         return extracted_items
@@ -108,7 +108,6 @@ def extract_symbols_from_legend(legend_img, category_filter):
         return []
 
 def multi_scale_match(drawing_gray, template, threshold, scales=None):
-    """Tests multiple scales to handle size differences between legend and drawings."""
     if scales is None:
         scales = [0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0, 2.5, 3.0]
     
@@ -144,140 +143,49 @@ def multi_scale_match(drawing_gray, template, threshold, scales=None):
             
     return filtered, [m[0] for m in filtered[:10]]
 
-def run_strict_takeoff_module_live(legend_img, drawing_imgs, package_name, category_filter, 
-                                   status_ph, metrics_ph, table_ph, accumulator, threshold, debug_mode,
-                                   global_progress_bar, global_status_log, total_drawings_global, current_global_idx):
-    """Live processing with persistent dashboard updates."""
-    if not drawing_imgs or not legend_img: return []
-
-    valid_drawings = []
-    for d_img in drawing_imgs:
-        if d_img is None: continue
-        try:
-            d_arr = np.array(d_img)
-            if len(d_arr.shape) == 3: d_arr = cv2.cvtColor(d_arr, cv2.COLOR_RGB2GRAY)
-            valid_drawings.append(d_arr)
-        except Exception: continue
-
-    if not valid_drawings:
-        status_ph.warning(f"No valid drawings found for {package_name}")
-        return []
-
-    extracted_items = extract_symbols_from_legend(legend_img, category_filter)
-    if not extracted_items:
-        status_ph.warning(f"No symbols detected for '{category_filter}'. Check legend section ratios.")
-        return []
-
-    total_drawings = len(valid_drawings)
-    cumulative_scanned = 0
-    cumulative_matches = sum(item['Count'] for item in accumulator.values())
-    
-    debug_images = []
-    
-    # Initialize metrics display immediately
-    metrics_ph.markdown(
-        f"""
-        <div style="background-color:#f0f2f6; padding:15px; border-radius:8px; margin-bottom:10px;">
-            <div style="display:flex; justify-content:space-between; text-align:center;">
-                <div><div style="font-size:12px; color:#666;"> DRAWINGS SCANNED</div>
-                <div style="font-size:24px; font-weight:bold; color:#1f77b4;">0/{total_drawings}</div></div>
-                <div><div style="font-size:12px; color:#666;">⚡ TOTAL MATCHES FOUND</div>
-                <div style="font-size:24px; font-weight:bold; color:#2ca02c;">{cumulative_matches}</div></div>
-                <div><div style="font-size:12px; color:#666;">🔍 ACTIVE TEMPLATES</div>
-                <div style="font-size:24px; font-weight:bold; color:#ff7f0e;">{len(extracted_items)}</div></div>
-            </div>
-        </div>
-        """, unsafe_allow_html=True
-    )
-    
-    status_ph.info(f"**Starting scan:** {package_name}\n**Templates loaded:** {len(extracted_items)}\n**Threshold:** {threshold}\n**Scales:** 0.3x-3.0x")
-
-    for idx, d_arr in enumerate(valid_drawings, 1):
-        drawing_matches = 0
-        
-        # Update global progress bar
-        current_global_idx[0] += 1
-        progress_pct = (current_global_idx[0] / total_drawings_global) * 100
-        global_progress_bar.progress(progress_pct / 100)
-        
-        # Update status log
-        log_msg = f"[{package_name}] Processing drawing {idx}/{total_drawings}..."
-        global_status_log.text(log_msg)
-        
-        for item in extracted_items:
-            try:
-                matches, debug_pts = multi_scale_match(d_arr, item["template"], threshold)
-                symbol_key = item["name"]
+# -----------------------------------------------------------------------------
+# 3. PREVIEW TEMPLATES SECTION (NEW!)
+# -----------------------------------------------------------------------------
+if legend_file and preview_btn:
+    with st.spinner("Extracting symbols from legend..."):
+        legend_img = load_image_safely(legend_file)
+        if legend_img:
+            # Extract for ALL sections at once
+            all_templates = extract_symbols_from_legend(legend_img, category_filter="All")
+            
+            if all_templates:
+                st.success(f"✅ Extracted {len(all_templates)} symbol templates from legend.")
                 
-                if symbol_key not in accumulator:
-                    accumulator[symbol_key] = {
-                        "System Category": item["category"],
-                        "Legend Icon": item["icon_bytes"],
-                        "Model / Description": symbol_key,
-                        "Scan Package": package_name,
-                        "Count": 0,
-                    }
+                # Display as a scrollable grid
+                st.subheader("🖼️ Preview Extracted Templates")
+                cols = st.columns(5)  # 5 per row
+                for idx, item in enumerate(all_templates):
+                    col = cols[idx % 5]
+                    with col:
+                        st.image(
+                            item["icon_bytes"],
+                            caption=f"{item['name']} ({item['category']})",
+                            use_column_width=True
+                        )
+                        # Optional: show bbox size for debugging
+                        # st.caption(f"BBox: {item['orig_bbox']}")
                 
-                count_increment = len(matches)
-                accumulator[symbol_key]["Count"] += count_increment
-                drawing_matches += count_increment
-                
-                if debug_mode and debug_pts:
-                    debug_images.append((d_arr.copy(), debug_pts, item["name"]))
-                    
-            except Exception as e:
-                print(f"Match error: {e}")
-                continue
-
-        cumulative_scanned += 1
-        cumulative_matches += drawing_matches
-
-        # Update Metrics Dashboard (every drawing)
-        metrics_ph.markdown(
-            f"""
-            <div style="background-color:#f0f2f6; padding:15px; border-radius:8px; margin-bottom:10px;">
-                <div style="display:flex; justify-content:space-between; text-align:center;">
-                    <div><div style="font-size:12px; color:#666;">📄 DRAWINGS SCANNED</div>
-                    <div style="font-size:24px; font-weight:bold; color:#1f77b4;">{cumulative_scanned}/{total_drawings}</div></div>
-                    <div><div style="font-size:12px; color:#666;">⚡ TOTAL MATCHES FOUND</div>
-                    <div style="font-size:24px; font-weight:bold; color:#2ca02c;">{cumulative_matches}</div></div>
-                    <div><div style="font-size:12px; color:#666;">🔍 ACTIVE TEMPLATES</div>
-                    <div style="font-size:24px; font-weight:bold; color:#ff7f0e;">{len(extracted_items)}</div></div>
-                </div>
-            </div>
-            """, unsafe_allow_html=True
-        )
-
-        status_text = (
-            f"**Scanning:** {package_name}\n"
-            f"**Progress:** Drawing {idx}/{total_drawings} | +{drawing_matches} new matches\n"
-            f"**Cumulative:** {cumulative_scanned} scanned → {cumulative_matches} total matches\n"
-            f"**Threshold:** {threshold} | Scales: 0.3x-3.0x"
-        )
-        status_ph.info(status_text)
-
-        # Update Table periodically (every 3 drawings or last one)
-        if idx % 3 == 0 or idx == total_drawings:
-            if accumulator:
-                live_df = pd.DataFrame(list(accumulator.values()))
-                try:
-                    table_ph.dataframe(live_df, column_config={
-                        "Legend Icon": st.column_config.ImageColumn("Legend Symbol", width="small"),
-                        "Count": st.column_config.NumberColumn("Verified Count", format="%d ⚡"),
-                    }, use_container_width=True, hide_index=True)
-                except Exception:
-                    table_ph.dataframe(live_df.drop(columns=["Legend Icon"], errors="ignore"))
-                
-    return debug_images
+                # Save to session state so scan can reuse them
+                st.session_state.preview_templates = all_templates
+                st.info("✅ Templates saved. Now upload drawings and click 'Start Scan' to begin matching.")
+            else:
+                st.warning("No symbols detected. Try adjusting the legend section boundaries in the code.")
+        else:
+            st.error("Failed to load legend image.")
 
 # -----------------------------------------------------------------------------
-# 3. MAIN EXECUTION LOGIC WITH PERSISTENT DASHBOARD
+# 4. MAIN SCAN EXECUTION (uses preview_templates if available)
 # -----------------------------------------------------------------------------
 if 'results_data' not in st.session_state: st.session_state.results_data = {}
 if 'scan_complete' not in st.session_state: st.session_state.scan_complete = False
-if 'debug_imgs' not in st.session_state: st.session_state.debug_imgs = []
+if 'debug_imgs' not in st.session_state: st.session_state.debug_imgs = {}
 
-# Create persistent dashboard placeholders OUTSIDE the button block
+# Persistent dashboard placeholders
 dashboard_container = st.container()
 status_box = dashboard_container.empty()
 metrics_box = dashboard_container.empty()
@@ -291,7 +199,7 @@ if process_btn:
     st.session_state.debug_imgs = []
     
     if not legend_file:
-        st.error("Please upload the Legend Sheet.")
+        st.error("Please upload the Legend Sheet first.")
     elif not power_files and not lighting_files:
         st.warning("Please upload at least one drawing file.")
     else:
@@ -303,27 +211,107 @@ if process_btn:
             lighting_images = [load_image_safely(f) for f in (lighting_files or []) if load_image_safely(f)]
             
             total_drawings = len(power_images) + len(lighting_images)
-            current_idx = [0]  # Mutable counter for global progress
+            current_idx = [0]
 
-            all_debug = []
-            
-            # Run Power Scan
-            dbg_p = run_strict_takeoff_module_live(
-                legend_image, power_images, "Power Package", "Power / Devices", 
-                status_box, metrics_box, table_box, st.session_state.results_data, 
-                match_threshold, debug_mode, progress_bar, status_log, total_drawings, current_idx
+            # Use pre-extracted templates if available (from preview), else extract now
+            if hasattr(st.session_state, 'preview_templates') and st.session_state.preview_templates:
+                all_templates = st.session_state.preview_templates
+            else:
+                # Fallback: extract on-the-fly
+                all_templates = extract_symbols_from_legend(legend_image, "All")
+                if not all_templates:
+                    st.warning("No templates found. Scanning will skip.")
+                    st.session_state.scan_complete = True
+                    st.rerun()
+
+            # Build accumulator from templates
+            accumulator = {
+                item["name"]: {
+                    "System Category": item["category"],
+                    "Legend Icon": item["icon_bytes"],
+                    "Model / Description": item["name"],
+                    "Scan Package": "Unknown",
+                    "Count": 0,
+                }
+                for item in all_templates
+            }
+
+            # Show initial metrics
+            metrics_box.markdown(
+                f"""
+                <div style="background-color:#f0f2f6; padding:15px; border-radius:8px; margin-bottom:10px;">
+                    <div style="display:flex; justify-content:space-between; text-align:center;">
+                        <div><div style="font-size:12px; color:#666;"> DRAWINGS SCANNED</div>
+                        <div style="font-size:24px; font-weight:bold; color:#1f77b4;">0/{total_drawings}</div></div>
+                        <div><div style="font-size:12px; color:#666;">⚡ TOTAL MATCHES FOUND</div>
+                        <div style="font-size:24px; font-weight:bold; color:#2ca02c;">0</div></div>
+                        <div><div style="font-size:12px; color:#666;">🔍 ACTIVE TEMPLATES</div>
+                        <div style="font-size:24px; font-weight:bold; color:#ff7f0e;">{len(all_templates)}</div></div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True
             )
-            if dbg_p: all_debug.extend(dbg_p)
-            
-            # Run Lighting Scan  
-            dbg_l = run_strict_takeoff_module_live(
-                legend_image, lighting_images, "Lighting Package", "Lighting", 
-                status_box, metrics_box, table_box, st.session_state.results_data, 
-                match_threshold, debug_mode, progress_bar, status_log, total_drawings, current_idx
-            )
-            if dbg_l: all_debug.extend(dbg_l)
-            
-            st.session_state.debug_imgs = all_debug
+            status_box.info(f"Starting scan...\nTemplates loaded: {len(all_templates)}\nThreshold: {match_threshold}")
+
+            # Process Power
+            for idx, d_arr in enumerate(power_images, 1):
+                current_idx[0] += 1
+                progress_bar.progress(current_idx[0] / total_drawings)
+                status_log.text(f"[Power] Processing drawing {idx}/{len(power_images)}...")
+
+                for name, row in accumulator.items():
+                    try:
+                        template = None
+                        # Find template by name in original list
+                        for t in all_templates:
+                            if t["name"] == name:
+                                template = t["template"]
+                                break
+                        if template is None: continue
+
+                        matches, _ = multi_scale_match(d_arr, template, match_threshold)
+                        row["Count"] += len(matches)
+                        
+                    except Exception:
+                        continue
+
+                if idx % 3 == 0 or idx == len(power_images):
+                    live_df = pd.DataFrame(list(accumulator.values()))
+                    table_box.dataframe(live_df, column_config={
+                        "Legend Icon": st.column_config.ImageColumn("Legend Symbol", width="small"),
+                        "Count": st.column_config.NumberColumn("Verified Count", format="%d ⚡"),
+                    }, use_container_width=True, hide_index=True)
+
+            # Process Lighting
+            for idx, d_arr in enumerate(lighting_images, 1):
+                current_idx[0] += 1
+                progress_bar.progress(current_idx[0] / total_drawings)
+                status_log.text(f"[Lighting] Processing drawing {idx}/{len(lighting_images)}...")
+
+                for name, row in accumulator.items():
+                    try:
+                        template = None
+                        for t in all_templates:
+                            if t["name"] == name:
+                                template = t["template"]
+                                break
+                        if template is None: continue
+
+                        matches, _ = multi_scale_match(d_arr, template, match_threshold)
+                        row["Count"] += len(matches)
+                        
+                    except Exception:
+                        continue
+
+                if idx % 3 == 0 or idx == len(lighting_images):
+                    live_df = pd.DataFrame(list(accumulator.values()))
+                    table_box.dataframe(live_df, column_config={
+                        "Legend Icon": st.column_config.ImageColumn("Legend Symbol", width="small"),
+                        "Count": st.column_config.NumberColumn("Verified Count", format="%d ⚡"),
+                    }, use_container_width=True, hide_index=True)
+
+            # Finalize
+            st.session_state.results_data = accumulator
             st.session_state.scan_complete = True
             st.rerun()
 
@@ -331,27 +319,25 @@ if process_btn:
             st.error(f"Critical Error: {str(e)}")
             st.code(traceback.format_exc())
 
-elif st.session_state.scan_complete and st.session_state.results_data:
+elif st.session_state.scan_complete:
     df_summary = pd.DataFrame(list(st.session_state.results_data.values()))
     total_matches = sum(row['Count'] for row in st.session_state.results_data.values())
     
-    # Clear scanning dashboard and show completion
-    status_box.success(f"✅ SCAN COMPLETE! Total: {total_matches} verified matches across {df_summary['Scan Package'].nunique()} packages.")
-    metrics_box.empty()  # Hide metrics after completion
+    status_box.success(f"✅ SCAN COMPLETE! Total: {total_matches} verified matches.")
+    metrics_box.empty()
     progress_bar.empty()
     status_log.empty()
-    
-    # Show Debug Visualizations if enabled
-    if debug_mode and st.session_state.debug_imgs:
-        st.subheader("🔍 Debug Visualization (Top Matches per Symbol)")
+
+    if debug_mode and hasattr(st.session_state, 'debug_imgs') and st.session_state.debug_imgs:
+        st.subheader("🔍 Debug Visualization")
         cols = st.columns(3)
         for i, (img_arr, pts, name) in enumerate(st.session_state.debug_imgs[:9]):
             vis_img = cv2.cvtColor(img_arr, cv2.COLOR_GRAY2RGB)
             for pt in pts:
                 cv2.rectangle(vis_img, pt, (pt[0]+20, pt[1]+20), (255, 0, 0), 2)
             with cols[i % 3]:
-                st.image(vis_img, caption=f"{name} ({len(pts)} matches shown)", use_container_width=True)
-    
+                st.image(vis_img, caption=f"{name}", use_container_width=True)
+
     st.subheader("📋 Itemized Takeoff Schedule")
     st.dataframe(df_summary, column_config={
         "Legend Icon": st.column_config.ImageColumn("Legend Symbol", width="small"),
@@ -374,20 +360,23 @@ elif st.session_state.scan_complete and st.session_state.results_data:
     y -= 20; c.setFont("Helvetica", 9)
     for _, row in df_summary.iterrows():
         if y < 50: c.showPage(); y = height-50; c.setFont("Helvetica", 9)
-        c.drawString(54, y, str(row["System Category"])); c.drawString(180, y, str(row["Model / Description"]))
-        c.drawString(380, y, str(row["Scan Package"])); c.drawString(490, y, str(row["Count"]))
+        c.drawString(54, y, str(row["System Category"]))
+        c.drawString(180, y, str(row["Model / Description"]))
+        c.drawString(380, y, str(row["Scan Package"]))
+        c.drawString(490, y, str(row["Count"]))
         y -= 18
     c.save()
 
     col1, col2 = st.columns(2)
     with col1: st.download_button("📥 Export Excel (.xlsx)", excel_output.getvalue(), "DrBuild_Takeoff.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    with col2: st.download_button(" Download PDF Report", pdf_output.getvalue(), "DrBuild_Report.pdf", "application/pdf")
+    with col2: st.download_button("📄 Download PDF Report", pdf_output.getvalue(), "DrBuild_Report.pdf", "application/pdf")
 
 else:
-    # Initial state - hide dashboard elements
+    # Initial state
     status_box.empty()
     metrics_box.empty()
     progress_bar.empty()
     status_log.empty()
     table_box.empty()
     st.info("Upload your legend sheet and optional drawing files in the sidebar to begin.")
+    st.caption("💡 Tip: Click 'Preview Legend Templates' after uploading the legend to inspect symbols before scanning.")
