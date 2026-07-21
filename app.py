@@ -363,3 +363,37 @@ st.markdown("""
     <p>🔌 Electrical Receptacle Counter | Built with Streamlit | Works on any browser</p>
 </div>
 """, unsafe_allow_html=True)
+"""
+Electrical Receptacle Counter - Streamlit Cloud App
+"""
+
+import streamlit as st
+import numpy as np
+import io
+from PIL import Image
+from datetime import datetime
+import json
+
+# OpenCV import with detailed error handling
+try:
+    import cv2
+    st.sidebar.success("✅ OpenCV loaded")
+except ImportError as e:
+    st.error(f"""
+    ❌ OpenCV import error: {str(e)}
+    
+    Please make sure requirements.txt has:
+    opencv-python-headless==4.9.0.80
+    
+    And packages.txt has:
+    libgl1-mesa-glx
+    libglib2.0-0
+    libsm6
+    libxext6
+    libxrender-dev
+    libgomp1
+    """)
+    st.stop()
+
+# Rest of the app code...
+# [Use the same app.py code from my previous message]
